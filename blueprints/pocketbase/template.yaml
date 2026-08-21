@@ -1,0 +1,105 @@
+apiVersion: blueprints.stackship.se/v2
+kind: BlueprintTemplate
+
+# Ported from the v1 rendered-manifest form. Unlike supabase this one needed no
+# new format features — Service, StatefulSet and Ingress map straight onto a
+# component with a persistent volume and one endpoint.
+
+metadata:
+  slug: pocketbase
+  title: PocketBase
+  description: >-
+    PocketBase is an open source backend consisting of a realtime database,
+    authentication, file storage, and more.
+  version: "0.31.0"
+  category: Databases
+  tags: [pocketbase, database, realtime, auth, file-storage]
+  documentation: https://pocketbase.io/docs/
+
+parameters:
+  - name: version
+    type: Select
+    label: PocketBase Version
+    description: Docker image version tag
+    options: ["0.31.0", "0.30.0", "0.29.0"]
+    default: "0.31.0"
+
+  - name: storage_size
+    type: Select
+    label: Database Storage
+    description: Persistent volume size for PocketBase data
+    options: ["1Gi", "5Gi", "10Gi", "20Gi"]
+    default: "5Gi"
+
+  - name: ingress_host
+    type: String
+    label: Ingress Hostname
+    description: >-
+      Public hostname for the instance. Defaults to the instance name under the
+      platform domain — override to use a custom domain.
+    default: "[%name%].{{domain_suffix}}"
+
+  - name: ingress_certificate_issuer
+    type: String
+    label: Certificate Issuer
+    description: cert-manager ClusterIssuer name
+    default: "{{cert_issuer}}"
+    advanced: true
+
+outputs:
+  - name: admin_url
+    label: Admin UI
+    description: PocketBase admin dashboard
+    type: Url
+    value: "https://[%ingress_host%]/_/"
+  - name: api_url
+    label: API URL
+    description: REST API base for SDK and HTTP clients
+    type: Url
+    value: "https://[%ingress_host%]/api/"
+
+instance:
+  components:
+    - name: pocketbase
+      startupOrder: 1
+      replicas: 1
+      computePlan: small
+      containers:
+        - name: pocketbase
+          image: ghcr.io/pocketbase/pocketbase
+          tag: "[%version%]"
+          ports:
+            - name: http
+              port: 8090
+          probes:
+            readiness:
+              type: http
+              port: http
+              path: /api/health
+              initialDelaySeconds: 5
+              periodSeconds: 10
+              failureThreshold: 6
+            liveness:
+              type: http
+              port: http
+              path: /api/health
+              initialDelaySeconds: 15
+              periodSeconds: 20
+              failureThreshold: 3
+          mounts:
+            - volume: data
+              path: /pb/pb_data
+      volumes:
+        - name: data
+          persistent:
+            size: "[%storage_size%]"
+            tier: standard
+            fsGroup: 2000
+
+  endpoints:
+    - name: web
+      component: pocketbase
+      port: http
+      expose: ingress
+      hostname: "[%ingress_host%]"
+      issuer: "[%ingress_certificate_issuer%]"
