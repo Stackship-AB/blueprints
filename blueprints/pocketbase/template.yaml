@@ -4,6 +4,22 @@ kind: BlueprintTemplate
 # Ported from the v1 rendered-manifest form. Unlike supabase this one needed no
 # new format features — Service, StatefulSet and Ingress map straight onto a
 # component with a persistent volume and one endpoint.
+#
+# There is no official PocketBase container image: upstream ships release zips,
+# not a Dockerfile, and `ghcr.io/pocketbase/pocketbase` — what the v1 port
+# pointed at — has never existed. We use docker.io/elestio/pocketbase. Three
+# things about it shape this file:
+#
+#   - Its tags carry a `v` prefix, so the tag is built as `v[%version%]` and the
+#     `version` parameter stays a bare PocketBase version, matching
+#     metadata.version and what the release notes call it.
+#   - It does not mirror every upstream patch (0.39.4 and 0.37.4/.5 were never
+#     published, for instance), so every option below is a tag confirmed to
+#     resolve rather than the newest upstream patch of that minor.
+#   - Its entrypoint is `pocketbase serve --http=0.0.0.0:8090 --dir=/pb_data`
+#     running as the non-root `pocketbase` user, which is why the volume mounts
+#     at /pb_data and why fsGroup below is load-bearing: it is what leaves the
+#     mounted PV group-writable for that user.
 
 metadata:
   slug: pocketbase
@@ -11,7 +27,7 @@ metadata:
   description: >-
     PocketBase is an open source backend consisting of a realtime database,
     authentication, file storage, and more.
-  version: "0.31.0"
+  version: "0.39.11"
   category: Databases
   tags: [pocketbase, database, realtime, auth, file-storage]
   documentation: https://pocketbase.io/docs/
@@ -20,9 +36,9 @@ parameters:
   - name: version
     type: Select
     label: PocketBase Version
-    description: Docker image version tag
-    options: ["0.31.0", "0.30.0", "0.29.0"]
-    default: "0.31.0"
+    description: PocketBase release to run
+    options: ["0.39.11", "0.38.2", "0.37.3"]
+    default: "0.39.11"
 
   - name: storage_size
     type: Select
@@ -66,8 +82,8 @@ instance:
       computePlan: small
       containers:
         - name: pocketbase
-          image: ghcr.io/pocketbase/pocketbase
-          tag: "[%version%]"
+          image: docker.io/elestio/pocketbase
+          tag: "v[%version%]"
           ports:
             - name: http
               port: 8090
@@ -88,7 +104,7 @@ instance:
               failureThreshold: 3
           mounts:
             - volume: data
-              path: /pb/pb_data
+              path: /pb_data
       volumes:
         - name: data
           persistent:
