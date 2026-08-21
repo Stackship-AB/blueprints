@@ -1,0 +1,1150 @@
+apiVersion: blueprints.stackship.se/v2
+kind: BlueprintTemplate
+
+# Ported from the v1 rendered-manifest form (13 raw Kubernetes documents) to the
+# v2 template document. This template is what falsified the first cut of the
+# format: it needs file content, subPath mounts, exec probes, a specific uid,
+# somewhere for generated secrets to live, and one hostname carrying several
+# paths — none of which §2 could express until D7/D8/D9.
+#
+# Structural changes worth knowing when comparing against the old files:
+#   - The `secrets` component is gone. Its five generated values and five
+#     derived connection strings live in the instance's Stackship Secrets vault
+#     and are referenced with env[].secretRef, so no secret is ever written into
+#     the CR where a containerinstance/read holder could see it.
+#   - Component `postgresql` is named `postgres`, because the ClusterIP Service
+#     is {instance}-{component} and every other component addresses it as
+#     `[%name%]-postgres`. Renaming it would have silently broken that wiring.
+#   - The two Ingress documents become two endpoints sharing one hostname: the
+#     API paths on the gateway, `/` on studio, and only studio is auth-guarded.
+
+metadata:
+  slug: supabase
+  title: Supabase
+  description: >-
+    Self-hosted Supabase — open source Firebase alternative with PostgreSQL
+    database, authentication, instant APIs, realtime subscriptions, storage, and
+    Studio dashboard.
+  version: "3.0"
+  category: Platforms
+  tags: [supabase, database, auth, storage, realtime, api, postgres]
+  documentation: https://supabase.com/docs/guides/self-hosting
+
+parameters:
+  - name: db_password
+    type: Secret
+    label: Database Password
+    description: Password for the PostgreSQL superuser. Auto-generated.
+    generate: true
+    generateLength: 32
+
+  - name: jwt_secret
+    type: Secret
+    label: JWT Secret
+    description: Shared secret signing every JWT. Auto-generated.
+    generate: true
+    generateLength: 64
+
+  - name: anon_key
+    type: Secret
+    label: Anonymous API Key
+    description: Pre-configured JWT granting anonymous access to public endpoints.
+    generate: true
+    generateSpec: jwt
+    generateClaims:
+      role: anon
+      iss: supabase
+
+  - name: service_role_key
+    type: Secret
+    label: Service Role Key
+    description: >-
+      Pre-configured JWT with full administrative access that bypasses Row Level
+      Security. Never expose it in client-side code.
+    generate: true
+    generateSpec: jwt
+    generateClaims:
+      role: service_role
+      iss: supabase
+
+  - name: pg_meta_crypto_key
+    type: Secret
+    label: pg-meta crypto key
+    description: 32-byte key pg-meta uses to encrypt foreign-data-wrapper credentials.
+    generate: true
+    generateLength: 32
+
+  # Derived secrets. Generation alone is not enough: each of these composes the
+  # password with the postgres service name, and each is as sensitive as the
+  # password itself — so they go to the vault, not into the document. The
+  # _urlencoded twin is what keeps a password containing URI-reserved characters
+  # from producing a connection string that parses wrong.
+  - name: db_url
+    type: Secret
+    label: Postgres URL (superuser)
+    derived: "postgresql://postgres:[%db_password_urlencoded%]@[%name%]-postgres:5432/postgres"
+
+  - name: db_url_auth
+    type: Secret
+    label: Postgres URL (auth)
+    derived: "postgresql://supabase_auth_admin:[%db_password_urlencoded%]@[%name%]-postgres:5432/postgres"
+
+  - name: db_url_rest
+    type: Secret
+    label: Postgres URL (rest)
+    derived: "postgresql://authenticator:[%db_password_urlencoded%]@[%name%]-postgres:5432/postgres"
+
+  - name: db_url_realtime
+    type: Secret
+    label: Postgres URL (realtime)
+    derived: "postgresql://supabase_admin:[%db_password_urlencoded%]@[%name%]-postgres:5432/postgres"
+
+  - name: db_url_storage
+    type: Secret
+    label: Postgres URL (storage)
+    derived: "postgresql://supabase_storage_admin:[%db_password_urlencoded%]@[%name%]-postgres:5432/postgres"
+
+  - name: storage_size
+    type: Select
+    label: Database Storage
+    description: Persistent volume size for PostgreSQL data
+    options: ["5Gi", "10Gi", "20Gi", "50Gi", "100Gi"]
+    default: "10Gi"
+
+  - name: postgres_version
+    type: Select
+    label: PostgreSQL Version
+    description: Supabase PostgreSQL image tag with pre-loaded extensions
+    options: ["17.6.1.084"]
+    default: "17.6.1.084"
+
+  - name: ingress_host
+    type: String
+    label: Public Hostname
+    description: >-
+      Hostname clients and Studio use to reach this instance. Defaults to the
+      instance name under the platform domain — override for a custom domain.
+    default: "[%name%].{{domain_suffix}}"
+
+  - name: ingress_certificate_issuer
+    type: String
+    label: Certificate Issuer
+    description: cert-manager ClusterIssuer for the TLS certificate.
+    default: "{{cert_issuer}}"
+    advanced: true
+
+outputs:
+  - name: studio_url
+    label: Studio URL
+    description: Supabase Studio web UI
+    type: Url
+    value: "https://[%ingress_host%]/"
+  - name: api_url
+    label: API URL
+    description: Public REST / Realtime / Auth / Storage gateway
+    type: Url
+    value: "https://[%ingress_host%]/"
+
+instance:
+  components:
+    - name: postgres
+      startupOrder: 1
+      replicas: 1
+      # The image runs rootless as uid 100; tenant policy forbids the root init
+      # container that chowning the data dir would otherwise need, so the
+      # entrypoint's own mkdir + initdb create it — which only works because the
+      # pod runs as that uid with a matching fsGroup.
+      runAsUser: 100
+      runAsGroup: 101
+      computePlan: medium
+      cpu: 250m
+      memory: 1Gi
+      containers:
+        - name: postgres
+          image: registry.stackship.se/blueprints/supabase/postgres
+          tag: "[%postgres_version%]"
+          # The image's own ENTRYPOINT and CMD, declared so the operator can wrap
+          # them: a container with a vault-backed variable runs through the
+          # secret-exec shim, and Kubernetes has no way to PREPEND to an
+          # entrypoint — setting command replaces it. Without this the secret is
+          # resolved and then dropped, which is how postgres reported its password
+          # unset moments after secret-init reported resolving it.
+          command:
+            - docker-entrypoint.sh
+          args:
+            - postgres
+            - -D
+            - /etc/postgresql
+          ports:
+            - name: postgres
+              port: 5432
+          env:
+            - name: POSTGRES_PASSWORD
+              secretRef: { vault: "[%instance_vault%]", key: db_password }
+            - name: POSTGRES_DB
+              value: "postgres"
+            - name: JWT_SECRET
+              secretRef: { vault: "[%instance_vault%]", key: jwt_secret }
+            - name: JWT_EXP
+              value: "3600"
+          probes:
+            # exec, not tcp: the socket accepts while initdb is still running, so
+            # a TCP probe reads ready and the next startup wave would launch
+            # every downstream service against an uninitialised database.
+            readiness:
+              type: exec
+              command: [pg_isready, -U, postgres, -h, localhost]
+              initialDelaySeconds: 10
+              periodSeconds: 10
+              failureThreshold: 6
+            liveness:
+              type: exec
+              command: [pg_isready, -U, postgres, -h, localhost]
+              initialDelaySeconds: 30
+              periodSeconds: 20
+              failureThreshold: 3
+          mounts:
+            # Mounted at the postgres HOME, not at the data dir: initdb needs to
+            # create the data dir itself with mode 0700, and lost+found sitting
+            # at the parent keeps the data dir clean on first boot.
+            - volume: data
+              path: /var/lib/postgresql
+            # Each init script is subPath-mounted so it slots BESIDE the image's
+            # own numbered files rather than hiding the directory. The 99- prefix
+            # orders them after the image's own init.
+            - volume: init
+              path: /docker-entrypoint-initdb.d/init-scripts/99-roles.sql
+              subPath: 99-roles.sql
+              readOnly: true
+            - volume: init
+              path: /docker-entrypoint-initdb.d/init-scripts/99-jwt.sql
+              subPath: 99-jwt.sql
+              readOnly: true
+            - volume: init
+              path: /docker-entrypoint-initdb.d/migrations/99-realtime.sql
+              subPath: 99-realtime.sql
+              readOnly: true
+      volumes:
+        - name: data
+          persistent:
+            size: "[%storage_size%]"
+            tier: standard
+            fsGroup: 101
+        - name: init
+          files:
+            content:
+              # Vendored from supabase/supabase docker/volumes/db. The image
+              # creates the supabase_* roles but does NOT seed their passwords,
+              # set the JWT database parameters, or create the _realtime schema —
+              # without these three files every downstream service fails auth on
+              # first connect.
+              99-roles.sql: |
+                \set pgpass `echo "$POSTGRES_PASSWORD"`
+
+                ALTER USER authenticator WITH PASSWORD :'pgpass';
+                ALTER USER pgbouncer WITH PASSWORD :'pgpass';
+                ALTER USER supabase_auth_admin WITH PASSWORD :'pgpass';
+                ALTER USER supabase_storage_admin WITH PASSWORD :'pgpass';
+              99-jwt.sql: |
+                \set jwt_secret `echo "$JWT_SECRET"`
+                \set jwt_exp `echo "$JWT_EXP"`
+
+                ALTER DATABASE postgres SET "app.settings.jwt_secret" TO :'jwt_secret';
+                ALTER DATABASE postgres SET "app.settings.jwt_exp" TO :'jwt_exp';
+              99-realtime.sql: |
+                \set pguser `echo "$POSTGRES_USER"`
+
+                create schema if not exists _realtime;
+                alter schema _realtime owner to :pguser;
+    - name: auth
+      startupOrder: 2
+      computePlan: small
+      containers:
+        - name: auth
+          image: registry.stackship.se/blueprints/supabase/gotrue
+          tag: "v2.186.0"
+          # The image's own ENTRYPOINT and CMD, declared so the operator can wrap
+          # them: a container with a vault-backed variable runs through the
+          # secret-exec shim, and Kubernetes has no way to PREPEND to an
+          # entrypoint — setting command replaces it. Without this the secret is
+          # resolved and then dropped, which is how postgres reported its password
+          # unset moments after secret-init reported resolving it.
+          command:
+            - auth
+          ports:
+            - name: http
+              port: 9999
+          env:
+            - name: GOTRUE_API_HOST
+              value: "0.0.0.0"
+            - name: GOTRUE_API_PORT
+              value: "9999"
+            - name: API_EXTERNAL_URL
+              value: "http://[%name%]-gateway:8000"
+            - name: GOTRUE_DB_DRIVER
+              value: "postgres"
+            - name: GOTRUE_DB_DATABASE_URL
+              secretRef: { vault: "[%instance_vault%]", key: db_url_auth }
+            - name: GOTRUE_SITE_URL
+              value: "http://[%name%]-studio:3000"
+            - name: GOTRUE_URI_ALLOW_LIST
+              value: ""
+            - name: GOTRUE_DISABLE_SIGNUP
+              value: "false"
+            - name: GOTRUE_JWT_SECRET
+              secretRef: { vault: "[%instance_vault%]", key: jwt_secret }
+            - name: GOTRUE_JWT_EXP
+              value: "3600"
+            - name: GOTRUE_JWT_DEFAULT_GROUP_NAME
+              value: "authenticated"
+            - name: GOTRUE_JWT_ADMIN_ROLES
+              value: "service_role"
+            - name: GOTRUE_JWT_AUD
+              value: "authenticated"
+            - name: GOTRUE_JWT_ISSUER
+              value: "http://[%name%]-gateway:8000/auth/v1"
+            - name: GOTRUE_EXTERNAL_EMAIL_ENABLED
+              value: "true"
+            - name: GOTRUE_MAILER_AUTOCONFIRM
+              value: "true"
+            - name: GOTRUE_SMS_AUTOCONFIRM
+              value: "true"
+          probes:
+            readiness:
+              type: http
+              port: http
+              path: /health
+              initialDelaySeconds: 5
+              periodSeconds: 10
+              failureThreshold: 6
+            liveness:
+              type: http
+              port: http
+              path: /health
+              initialDelaySeconds: 15
+              periodSeconds: 20
+              failureThreshold: 3
+    - name: rest
+      startupOrder: 2
+      computePlan: small
+      containers:
+        - name: rest
+          image: registry.stackship.se/blueprints/supabase/postgrest
+          tag: "v14.8"
+          # The image's own ENTRYPOINT and CMD, declared so the operator can wrap
+          # them: a container with a vault-backed variable runs through the
+          # secret-exec shim, and Kubernetes has no way to PREPEND to an
+          # entrypoint — setting command replaces it. Without this the secret is
+          # resolved and then dropped, which is how postgres reported its password
+          # unset moments after secret-init reported resolving it.
+          command:
+            - /bin/postgrest
+          ports:
+            - name: http
+              port: 3000
+          env:
+            - name: PGRST_DB_URI
+              secretRef: { vault: "[%instance_vault%]", key: db_url_rest }
+            - name: PGRST_DB_SCHEMAS
+              value: "public,storage,graphql_public"
+            - name: PGRST_DB_ANON_ROLE
+              value: "anon"
+            - name: PGRST_JWT_SECRET
+              secretRef: { vault: "[%instance_vault%]", key: jwt_secret }
+            - name: PGRST_DB_USE_LEGACY_GUCS
+              value: "false"
+            - name: PGRST_APP_SETTINGS_JWT_SECRET
+              secretRef: { vault: "[%instance_vault%]", key: jwt_secret }
+            - name: PGRST_APP_SETTINGS_JWT_EXP
+              value: "3600"
+          probes:
+            readiness:
+              type: http
+              port: http
+              path: /
+              initialDelaySeconds: 5
+              periodSeconds: 10
+              failureThreshold: 6
+            liveness:
+              type: http
+              port: http
+              path: /
+              initialDelaySeconds: 15
+              periodSeconds: 20
+              failureThreshold: 3
+    - name: realtime
+      startupOrder: 2
+      computePlan: medium
+      containers:
+        - name: realtime
+          image: registry.stackship.se/blueprints/supabase/realtime
+          tag: "v2.76.5"
+          # Upstream's entrypoint is /app/run.sh, which drops privileges with
+          # `sudo -E -u nobody` before running migrations. sudo needs setresuid,
+          # and every container here runs with allowPrivilegeEscalation=false and
+          # all capabilities dropped, so it dies before doing any work. That floor
+          # is deliberate and not relaxable per component — `hardened` gates only
+          # runAsNonRoot and readOnlyRootFilesystem.
+          #
+          # So run.sh's work is inlined without the privilege drop, keeping the
+          # branches this template actually activates (RLIMIT_NOFILE is set,
+          # SEED_SELF_HOST is true) and omitting the ones it does not
+          # (ENABLE_ERL_CRASH_DUMP, GENERATE_CLUSTER_CERTS). tini is kept so PID 1
+          # still reaps.
+          #
+          # The deviation from upstream is that migrations run as root rather than
+          # nobody. The server already ran as root under run.sh, which execs it
+          # after the sudo lines, so this widens the migration step only.
+          #
+          # This mirrors run.sh AT THE PINNED TAG. Re-read it when the tag moves.
+          command:
+            - /usr/bin/tini
+            - -s
+            - -g
+            - --
+            - /bin/bash
+            - -c
+          args:
+            - |
+              set -euo pipefail
+              if [ -n "${RLIMIT_NOFILE:-}" ]; then ulimit -Sn "$RLIMIT_NOFILE"; fi
+              /app/bin/migrate
+              if [ "${SEED_SELF_HOST:-}" = true ]; then
+                /app/bin/realtime eval 'Realtime.Release.seeds(Realtime.Repo)'
+              fi
+              exec /app/bin/server
+          ports:
+            - name: http
+              port: 4000
+          env:
+            - name: PORT
+              value: "4000"
+            - name: DB_HOST
+              value: "[%name%]-postgres"
+            - name: DB_PORT
+              value: "5432"
+            - name: DB_USER
+              value: "supabase_admin"
+            - name: DB_PASSWORD
+              secretRef: { vault: "[%instance_vault%]", key: db_password }
+            - name: DB_NAME
+              value: "postgres"
+            - name: DB_AFTER_CONNECT_QUERY
+              value: "SET search_path TO _realtime"
+            - name: DB_ENC_KEY
+              value: "supabaserealtime"
+            - name: API_JWT_SECRET
+              secretRef: { vault: "[%instance_vault%]", key: jwt_secret }
+            - name: METRICS_JWT_SECRET
+              secretRef: { vault: "[%instance_vault%]", key: jwt_secret }
+            - name: SECRET_KEY_BASE
+              secretRef: { vault: "[%instance_vault%]", key: jwt_secret }
+            - name: SEED_SELF_HOST
+              value: "true"
+            - name: RUN_JANITOR
+              value: "true"
+            - name: RLIMIT_NOFILE
+              value: "10000"
+            - name: DISABLE_HEALTHCHECK_LOGGING
+              value: "true"
+            - name: APP_NAME
+              value: "realtime"
+            - name: FLY_ALLOC_ID
+              value: "fly123"
+            - name: FLY_APP_NAME
+              value: "realtime"
+            - name: ERL_AFLAGS
+              value: "-proto_dist inet_tcp"
+            - name: ENABLE_TAILSCALE
+              value: "false"
+            - name: DNS_NODES
+              value: ""
+          probes:
+            readiness:
+              type: http
+              port: http
+              path: /
+              initialDelaySeconds: 10
+              periodSeconds: 10
+              failureThreshold: 6
+            liveness:
+              type: http
+              port: http
+              path: /
+              initialDelaySeconds: 20
+              periodSeconds: 20
+              failureThreshold: 3
+    - name: storage
+      startupOrder: 2
+      computePlan: small
+      containers:
+        - name: storage
+          image: registry.stackship.se/blueprints/supabase/storage-api
+          tag: "v1.48.26"
+          # The image's own ENTRYPOINT and CMD, declared so the operator can wrap
+          # them: a container with a vault-backed variable runs through the
+          # secret-exec shim, and Kubernetes has no way to PREPEND to an
+          # entrypoint — setting command replaces it. Without this the secret is
+          # resolved and then dropped, which is how postgres reported its password
+          # unset moments after secret-init reported resolving it.
+          command:
+            - docker-entrypoint.sh
+          args:
+            - node
+            - dist/start/server.js
+          ports:
+            - name: http
+              port: 5000
+          env:
+            - name: ANON_KEY
+              secretRef: { vault: "[%instance_vault%]", key: anon_key }
+            - name: SERVICE_KEY
+              secretRef: { vault: "[%instance_vault%]", key: service_role_key }
+            - name: POSTGREST_URL
+              value: "http://[%name%]-rest:3000"
+            - name: PGRST_JWT_SECRET
+              secretRef: { vault: "[%instance_vault%]", key: jwt_secret }
+            - name: AUTH_JWT_SECRET
+              secretRef: { vault: "[%instance_vault%]", key: jwt_secret }
+            - name: DATABASE_URL
+              secretRef: { vault: "[%instance_vault%]", key: db_url_storage }
+            - name: STORAGE_PUBLIC_URL
+              value: "https://[%ingress_host%]"
+            - name: REQUEST_ALLOW_X_FORWARDED_PATH
+              value: "true"
+            - name: FILE_SIZE_LIMIT
+              value: "52428800"
+            - name: STORAGE_BACKEND
+              value: "file"
+            - name: FILE_STORAGE_BACKEND_PATH
+              value: "/var/lib/storage"
+            - name: TENANT_ID
+              value: "stub"
+            - name: REGION
+              value: "stub"
+            - name: GLOBAL_S3_BUCKET
+              value: "stub"
+            - name: ENABLE_IMAGE_TRANSFORMATION
+              value: "true"
+            - name: IMGPROXY_URL
+              value: "http://[%name%]-imgproxy:5001"
+          probes:
+            readiness:
+              type: http
+              port: http
+              path: /status
+              initialDelaySeconds: 5
+              periodSeconds: 10
+              failureThreshold: 6
+            liveness:
+              type: http
+              port: http
+              path: /status
+              initialDelaySeconds: 15
+              periodSeconds: 20
+              failureThreshold: 3
+          mounts:
+            - volume: data
+              path: /var/lib/storage
+      volumes:
+        - name: data
+          persistent:
+            size: 10Gi
+            tier: standard
+    - name: meta
+      startupOrder: 2
+      computePlan: small
+      containers:
+        - name: meta
+          image: registry.stackship.se/blueprints/supabase/postgres-meta
+          tag: "v0.96.3"
+          # The image's own ENTRYPOINT and CMD, declared so the operator can wrap
+          # them: a container with a vault-backed variable runs through the
+          # secret-exec shim, and Kubernetes has no way to PREPEND to an
+          # entrypoint — setting command replaces it. Without this the secret is
+          # resolved and then dropped, which is how postgres reported its password
+          # unset moments after secret-init reported resolving it.
+          command:
+            - docker-entrypoint.sh
+          args:
+            - node
+            - dist/server/server.js
+          ports:
+            - name: http
+              port: 8080
+          env:
+            - name: PG_META_PORT
+              value: "8080"
+            - name: PG_META_DB_HOST
+              value: "[%name%]-postgres"
+            - name: PG_META_DB_PORT
+              value: "5432"
+            - name: PG_META_DB_NAME
+              value: "postgres"
+            - name: PG_META_DB_USER
+              value: "postgres"
+            - name: PG_META_DB_PASSWORD
+              secretRef: { vault: "[%instance_vault%]", key: db_password }
+            - name: CRYPTO_KEY
+              secretRef: { vault: "[%instance_vault%]", key: pg_meta_crypto_key }
+          probes:
+            readiness:
+              type: http
+              port: http
+              path: /health
+              initialDelaySeconds: 5
+              periodSeconds: 10
+              failureThreshold: 6
+            liveness:
+              type: http
+              port: http
+              path: /health
+              initialDelaySeconds: 10
+              periodSeconds: 20
+              failureThreshold: 3
+    - name: gateway
+      startupOrder: 3
+      computePlan: small
+      containers:
+        - name: kong
+          image: registry.stackship.se/blueprints/supabase/kong
+          tag: "3.9.1"
+          # The image's own ENTRYPOINT and CMD, declared so the operator can wrap
+          # them: a container with a vault-backed variable runs through the
+          # secret-exec shim, and Kubernetes has no way to PREPEND to an
+          # entrypoint — setting command replaces it. Without this the secret is
+          # resolved and then dropped, which is how postgres reported its password
+          # unset moments after secret-init reported resolving it.
+          command:
+            - /entrypoint.sh
+          args:
+            - kong
+            - docker-start
+          ports:
+            - name: http
+              port: 8000
+            - name: https
+              port: 8443
+          env:
+            - name: KONG_DATABASE
+              value: "off"
+            - name: KONG_DECLARATIVE_CONFIG
+              value: "/home/kong/kong.yml"
+            - name: KONG_DNS_ORDER
+              value: "LAST,A,CNAME"
+            - name: KONG_PLUGINS
+              value: "request-transformer,cors,key-auth,acl,basic-auth"
+            - name: KONG_NGINX_MAIN_WORKER_PROCESSES
+              value: "1"
+            - name: KONG_NGINX_PROXY_PROXY_BUFFER_SIZE
+              value: "160k"
+            - name: KONG_NGINX_PROXY_PROXY_BUFFERS
+              value: "64 160k"
+            - name: KONG_LOG_LEVEL
+              value: "warn"
+            - name: ANON_KEY
+              secretRef: { vault: "[%instance_vault%]", key: anon_key }
+            - name: SERVICE_ROLE_KEY
+              secretRef: { vault: "[%instance_vault%]", key: service_role_key }
+          probes:
+            readiness:
+              type: tcp
+              port: http
+              initialDelaySeconds: 10
+              periodSeconds: 10
+              failureThreshold: 6
+            liveness:
+              type: tcp
+              port: http
+              initialDelaySeconds: 20
+              periodSeconds: 20
+              failureThreshold: 3
+          mounts:
+            - volume: config
+              path: /home/kong/kong.yml
+              subPath: kong.yml
+              readOnly: true
+      volumes:
+        - name: config
+          files:
+            content:
+              # Kong's entire declarative route table. Without it the gateway
+              # starts and serves nothing.
+              kong.yml: |
+                _format_version: "2.1"
+                _transform: true
+
+                consumers:
+                  - username: DASHBOARD
+                  - username: anon
+                    keyauth_credentials:
+                      # Kong 3.x resolves {vault://env/...} references against env vars at
+                      # startup. The ANON_KEY / SERVICE_ROLE_KEY env vars below are sourced
+                      # from the supabase-secrets Secret via secretKeyRef so the JWT keys
+                      # never appear as plaintext in the ConfigMap or in the rendered
+                      # manifest stored on the BlueprintInstance CR.
+                      - key: "{vault://env/anon-key}"
+                  - username: service_role
+                    keyauth_credentials:
+                      - key: "{vault://env/service-role-key}"
+
+                acls:
+                  - consumer: anon
+                    group: anon
+                  - consumer: service_role
+                    group: admin
+
+                services:
+                  - name: auth-v1-open
+                    url: http://[%name%]-auth:9999/verify
+                    routes:
+                      - name: auth-v1-open
+                        strip_path: true
+                        paths:
+                          - /auth/v1/verify
+                    plugins:
+                      - name: cors
+                  - name: auth-v1-open-callback
+                    url: http://[%name%]-auth:9999/callback
+                    routes:
+                      - name: auth-v1-open-callback
+                        strip_path: true
+                        paths:
+                          - /auth/v1/callback
+                    plugins:
+                      - name: cors
+                  - name: auth-v1-open-authorize
+                    url: http://[%name%]-auth:9999/authorize
+                    routes:
+                      - name: auth-v1-open-authorize
+                        strip_path: true
+                        paths:
+                          - /auth/v1/authorize
+                    plugins:
+                      - name: cors
+                  - name: auth-v1
+                    _comment: "GoTrue: /auth/v1/* -> http://auth:9999/*"
+                    url: http://[%name%]-auth:9999/
+                    routes:
+                      - name: auth-v1
+                        strip_path: true
+                        paths:
+                          - /auth/v1/
+                    plugins:
+                      - name: cors
+                      - name: key-auth
+                        config:
+                          hide_credentials: false
+                      - name: acl
+                        config:
+                          hide_groups_header: true
+                          allow:
+                            - admin
+                            - anon
+                  - name: rest-v1
+                    _comment: "PostgREST: /rest/v1/* -> http://rest:3000/*"
+                    url: http://[%name%]-rest:3000/
+                    routes:
+                      - name: rest-v1
+                        strip_path: true
+                        paths:
+                          - /rest/v1/
+                    plugins:
+                      - name: cors
+                      - name: key-auth
+                        config:
+                          hide_credentials: false
+                      - name: acl
+                        config:
+                          hide_groups_header: true
+                          allow:
+                            - admin
+                            - anon
+                  - name: realtime-v1-ws
+                    _comment: "Realtime: /realtime/v1/* -> ws://realtime:4000/socket/*"
+                    url: http://[%name%]-realtime:4000/socket/
+                    routes:
+                      - name: realtime-v1-ws
+                        strip_path: true
+                        paths:
+                          - /realtime/v1/
+                    plugins:
+                      - name: cors
+                      - name: key-auth
+                        config:
+                          hide_credentials: false
+                      - name: acl
+                        config:
+                          hide_groups_header: true
+                          allow:
+                            - admin
+                            - anon
+                  - name: storage-v1
+                    _comment: "Storage: /storage/v1/* -> http://storage:5000/*"
+                    url: http://[%name%]-storage:5000/
+                    routes:
+                      - name: storage-v1
+                        strip_path: true
+                        paths:
+                          - /storage/v1/
+                    plugins:
+                      - name: cors
+                      - name: key-auth
+                        config:
+                          hide_credentials: false
+                      - name: acl
+                        config:
+                          hide_groups_header: true
+                          allow:
+                            - admin
+                            - anon
+                  - name: meta
+                    _comment: "pg-meta: /pg/* -> http://meta:8080/*"
+                    url: http://[%name%]-meta:8080/
+                    routes:
+                      - name: meta
+                        strip_path: true
+                        paths:
+                          - /pg/
+                    plugins:
+                      - name: key-auth
+                        config:
+                          hide_credentials: false
+                      - name: acl
+                        config:
+                          hide_groups_header: true
+                          allow:
+                            - admin
+                  - name: functions-v1
+                    _comment: "Edge functions: /functions/v1/* -> http://functions:9000/*"
+                    url: http://[%name%]-functions:9000/
+                    routes:
+                      - name: functions-v1
+                        strip_path: true
+                        paths:
+                          - /functions/v1/
+                    plugins:
+                      - name: cors
+                      - name: key-auth
+                        config:
+                          hide_credentials: false
+                      - name: acl
+                        config:
+                          hide_groups_header: true
+                          allow:
+                            - admin
+                            - anon
+    - name: imgproxy
+      startupOrder: 3
+      computePlan: small
+      containers:
+        - name: imgproxy
+          image: registry.stackship.se/blueprints/supabase/imgproxy
+          tag: "v3.30.1"
+          ports:
+            - name: http
+              port: 5001
+          env:
+            - name: IMGPROXY_BIND
+              value: ":5001"
+            - name: IMGPROXY_ENABLE_WEBP_DETECTION
+              value: "true"
+            - name: IMGPROXY_LOCAL_FILESYSTEM_ROOT
+              value: "/"
+            - name: IMGPROXY_USE_ETAG
+              value: "true"
+            - name: IMGPROXY_MAX_SRC_RESOLUTION
+              value: "16.8"
+          probes:
+            readiness:
+              type: http
+              port: http
+              path: /health
+              initialDelaySeconds: 5
+              periodSeconds: 10
+              failureThreshold: 6
+            liveness:
+              type: http
+              port: http
+              path: /health
+              initialDelaySeconds: 10
+              periodSeconds: 20
+              failureThreshold: 3
+    - name: functions
+      startupOrder: 3
+      computePlan: small
+      initContainers:
+        # Seeds the persistent functions dir from the packaged entrypoint on
+        # first boot only, so a user's own edits survive a restart.
+        - name: seed
+          image: busybox
+          tag: "1.36"
+          command:
+            - sh
+            - -c
+            - |
+              mkdir -p /functions/main
+              if [ ! -f /functions/main/index.ts ]; then
+                cp /seed/index.ts /functions/main/index.ts
+              fi
+          mounts:
+            - volume: data
+              path: /functions
+            - volume: seed
+              path: /seed
+      containers:
+        - name: edge-runtime
+          image: registry.stackship.se/blueprints/supabase/functions
+          tag: "v1.71.2"
+          # The image's own ENTRYPOINT and CMD, declared so the operator can wrap
+          # them: a container with a vault-backed variable runs through the
+          # secret-exec shim, and Kubernetes has no way to PREPEND to an
+          # entrypoint — setting command replaces it. Without this the secret is
+          # resolved and then dropped, which is how postgres reported its password
+          # unset moments after secret-init reported resolving it.
+          command:
+            - edge-runtime
+          # The image's CMD is empty and bare `edge-runtime` prints its CLI help
+          # and exits — the runtime has never been startable without arguments.
+          # The old blueprint chart supplied these; the v2 port dropped them, and
+          # nothing noticed because no instance ever reached this wave until the
+          # first full run. Same values as the working prod blueprint.
+          args:
+            - start
+            - --main-service
+            - /home/deno/functions/main
+          ports:
+            - name: http
+              port: 9000
+          env:
+            - name: JWT_SECRET
+              secretRef: { vault: "[%instance_vault%]", key: jwt_secret }
+            - name: SUPABASE_URL
+              value: "http://[%name%]-gateway:8000"
+            - name: SUPABASE_PUBLIC_URL
+              value: "https://[%ingress_host%]"
+            - name: SUPABASE_ANON_KEY
+              secretRef: { vault: "[%instance_vault%]", key: anon_key }
+            - name: SUPABASE_SERVICE_ROLE_KEY
+              secretRef: { vault: "[%instance_vault%]", key: service_role_key }
+            - name: SUPABASE_DB_URL
+              secretRef: { vault: "[%instance_vault%]", key: db_url }
+            - name: VERIFY_JWT
+              value: "true"
+          probes:
+            readiness:
+              type: tcp
+              port: http
+              initialDelaySeconds: 10
+              periodSeconds: 10
+              failureThreshold: 6
+            liveness:
+              type: tcp
+              port: http
+              initialDelaySeconds: 30
+              periodSeconds: 20
+              failureThreshold: 3
+          mounts:
+            - volume: data
+              path: /home/deno/functions
+      volumes:
+        - name: data
+          persistent:
+            size: 1Gi
+            tier: standard
+        - name: seed
+          files:
+            content:
+              index.ts: |
+                import * as jose from 'https://deno.land/x/jose@v4.14.4/index.ts'
+
+                console.log('main function started')
+
+                const JWT_SECRET = Deno.env.get('JWT_SECRET')
+                const SUPABASE_URL = Deno.env.get('SUPABASE_URL')
+                const VERIFY_JWT = Deno.env.get('VERIFY_JWT') === 'true'
+
+                let SUPABASE_JWT_KEYS: ReturnType<typeof jose.createRemoteJWKSet> | null = null
+                if (SUPABASE_URL) {
+                  try {
+                    SUPABASE_JWT_KEYS = jose.createRemoteJWKSet(
+                      new URL('/auth/v1/.well-known/jwks.json', SUPABASE_URL)
+                    )
+                  } catch (e) {
+                    console.error('Failed to fetch JWKS from SUPABASE_URL:', e)
+                  }
+                }
+
+                function getAuthToken(req: Request) {
+                  const authHeader = req.headers.get('authorization')
+                  if (!authHeader) throw new Error('Missing authorization header')
+                  const [bearer, token] = authHeader.split(' ')
+                  if (bearer !== 'Bearer') throw new Error(`Auth header is not 'Bearer {token}'`)
+                  return token
+                }
+
+                async function isValidLegacyJWT(jwt: string): Promise<boolean> {
+                  if (!JWT_SECRET) return false
+                  const secretKey = new TextEncoder().encode(JWT_SECRET)
+                  try { await jose.jwtVerify(jwt, secretKey); return true } catch { return false }
+                }
+
+                async function isValidJWT(jwt: string): Promise<boolean> {
+                  if (!SUPABASE_JWT_KEYS) return false
+                  try { await jose.jwtVerify(jwt, SUPABASE_JWT_KEYS); return true } catch { return false }
+                }
+
+                async function isValidHybridJWT(jwt: string): Promise<boolean> {
+                  const { alg } = jose.decodeProtectedHeader(jwt)
+                  if (alg === 'HS256') return await isValidLegacyJWT(jwt)
+                  if (alg === 'ES256' || alg === 'RS256') return await isValidJWT(jwt)
+                  return false
+                }
+
+                Deno.serve(async (req: Request) => {
+                  if (req.method !== 'OPTIONS' && VERIFY_JWT) {
+                    try {
+                      const token = getAuthToken(req)
+                      if (!(await isValidHybridJWT(token))) {
+                        return new Response(JSON.stringify({ msg: 'Invalid JWT' }),
+                          { status: 401, headers: { 'Content-Type': 'application/json' } })
+                      }
+                    } catch (e) {
+                      return new Response(JSON.stringify({ msg: e.toString() }),
+                        { status: 401, headers: { 'Content-Type': 'application/json' } })
+                    }
+                  }
+
+                  const url = new URL(req.url)
+                  const service_name = url.pathname.split('/')[1]
+                  if (!service_name) {
+                    return new Response(JSON.stringify({ msg: 'missing function name in request' }),
+                      { status: 400, headers: { 'Content-Type': 'application/json' } })
+                  }
+
+                  const servicePath = `/home/deno/functions/${service_name}`
+                  const envVarsObj = Deno.env.toObject()
+                  const envVars = Object.keys(envVarsObj).map((k) => [k, envVarsObj[k]])
+
+                  try {
+                    const worker = await (globalThis as any).EdgeRuntime.userWorkers.create({
+                      servicePath,
+                      memoryLimitMb: 150,
+                      workerTimeoutMs: 60_000,
+                      noModuleCache: false,
+                      importMapPath: null,
+                      envVars,
+                    })
+                    return await worker.fetch(req)
+                  } catch (e) {
+                    return new Response(JSON.stringify({ msg: e.toString() }),
+                      { status: 500, headers: { 'Content-Type': 'application/json' } })
+                  }
+                })
+    - name: studio
+      startupOrder: 4
+      computePlan: medium
+      containers:
+        - name: studio
+          image: registry.stackship.se/blueprints/supabase/studio
+          tag: "2026.04.08-sha-205cbe7"
+          # The image's own ENTRYPOINT and CMD, declared so the operator can wrap
+          # them: a container with a vault-backed variable runs through the
+          # secret-exec shim, and Kubernetes has no way to PREPEND to an
+          # entrypoint — setting command replaces it. Without this the secret is
+          # resolved and then dropped, which is how postgres reported its password
+          # unset moments after secret-init reported resolving it.
+          command:
+            - docker-entrypoint.sh
+          args:
+            - node
+            - apps/studio/server.js
+          ports:
+            - name: http
+              port: 3000
+          env:
+            - name: HOSTNAME
+              value: "0.0.0.0"
+            - name: DEFAULT_ORGANIZATION_NAME
+              value: "Default Organization"
+            - name: DEFAULT_PROJECT_NAME
+              value: "Default Project"
+            - name: STUDIO_PG_META_URL
+              value: "http://[%name%]-meta:8080"
+            - name: PG_META_CRYPTO_KEY
+              secretRef: { vault: "[%instance_vault%]", key: pg_meta_crypto_key }
+            - name: PGRST_DB_SCHEMAS
+              value: "public,storage,graphql_public"
+            - name: PGRST_DB_MAX_ROWS
+              value: "1000"
+            - name: SUPABASE_URL
+              value: "http://[%name%]-gateway:8000"
+            - name: SUPABASE_PUBLIC_URL
+              value: "https://[%ingress_host%]"
+            - name: SUPABASE_ANON_KEY
+              secretRef: { vault: "[%instance_vault%]", key: anon_key }
+            - name: SUPABASE_SERVICE_KEY
+              secretRef: { vault: "[%instance_vault%]", key: service_role_key }
+            - name: AUTH_JWT_SECRET
+              secretRef: { vault: "[%instance_vault%]", key: jwt_secret }
+            - name: POSTGRES_HOST
+              value: "[%name%]-postgres"
+            - name: POSTGRES_PORT
+              value: "5432"
+            - name: POSTGRES_DB
+              value: "postgres"
+            - name: POSTGRES_PASSWORD
+              secretRef: { vault: "[%instance_vault%]", key: db_password }
+            - name: NEXT_PUBLIC_ENABLE_LOGS
+              value: "false"
+            - name: NEXT_ANALYTICS_BACKEND_PROVIDER
+              value: "postgres"
+            - name: EDGE_FUNCTIONS_MANAGEMENT_FOLDER
+              value: "/app/edge-functions"
+            - name: SNIPPETS_MANAGEMENT_FOLDER
+              value: "/app/snippets"
+          probes:
+            readiness:
+              type: tcp
+              port: http
+              initialDelaySeconds: 10
+              periodSeconds: 10
+              failureThreshold: 6
+            liveness:
+              type: tcp
+              port: http
+              initialDelaySeconds: 30
+              periodSeconds: 20
+              failureThreshold: 3
+          mounts:
+            - volume: edge-functions
+              path: /app/edge-functions
+            - volume: snippets
+              path: /app/snippets
+      volumes:
+        - name: edge-functions
+          emptyDir: {}
+        - name: snippets
+          emptyDir: {}
+  endpoints:
+    # Both endpoints share ONE hostname. They stay separate objects because the
+    # forward-auth wiring is per-object on nginx and only studio is guarded —
+    # the API paths carry their own JWT auth and must not sit behind the portal
+    # login. The certificate is keyed by host, so the two share one.
+    - name: api
+      component: gateway
+      port: http
+      expose: ingress
+      hostname: "[%ingress_host%]"
+      paths: ["/auth/v1", "/rest/v1", "/realtime/v1", "/storage/v1", "/pg"]
+      issuer: "[%ingress_certificate_issuer%]"
+      authGuard: false
+
+    - name: studio
+      component: studio
+      port: http
+      expose: ingress
+      hostname: "[%ingress_host%]"
+      paths: ["/"]
+      issuer: "[%ingress_certificate_issuer%]"
+      authGuard: true

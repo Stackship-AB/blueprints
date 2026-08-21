@@ -1,0 +1,336 @@
+apiVersion: blueprints.stackship.se/v2
+kind: BlueprintTemplate
+
+# Ported from the v1 rendered-manifest form. Alongside supabase this is the
+# template that needed the D7/D8/D9 features: a conditional bundled database,
+# postgres at uid 70 with an exec probe, a license file delivered as sensitive
+# content, and one hostname carrying the API and the web UI on different paths.
+
+metadata:
+  slug: stackship-data-hub
+  title: Stackship Data Hub
+  description: >-
+    Collect data from databases, APIs and files, transform it on the way in,
+    build views visually, and publish them as versioned REST endpoints.
+  version: "2.0"
+  category: Platforms
+  tags: [stackship, data, etl, ingestion, analytics, postgres, api]
+  documentation: https://gitlab.stackship.se/stackship-apps/data-lake/-/blob/main/DRIFT.md
+
+parameters:
+  - name: image_tag
+    type: String
+    label: Image Tag
+    description: >-
+      Tag of the datahub/api and datahub/web images. Pin a specific tag for a
+      production installation so a redeploy cannot silently move the version.
+    default: "latest"
+
+  - name: bundled_database
+    type: Boolean
+    label: Deploy PostgreSQL
+    description: >-
+      Deploy a PostgreSQL 17 instance alongside the application. Turn this off
+      to connect to a database you run yourself and fill in the fields below.
+    default: "true"
+
+  - name: db_host
+    type: String
+    label: Database Host
+    description: Points at the bundled instance unless you supply your own.
+    default: "[%name%]-postgres"
+
+  - name: db_port
+    type: String
+    label: Database Port
+    default: "5432"
+    advanced: true
+
+  - name: db_name
+    type: String
+    label: Database Name
+    default: "stackship"
+
+  - name: db_user
+    type: String
+    label: Database User
+    default: "stackship"
+
+  - name: db_password
+    type: Secret
+    label: Database Password
+    generate: true
+    generateLength: 32
+
+  - name: db_storage_size
+    type: Select
+    label: Database Storage
+    options: ["5Gi", "10Gi", "20Gi", "50Gi"]
+    default: "10Gi"
+
+  - name: file_storage_size
+    type: Select
+    label: File Storage
+    description: Volume for uploads and inbound files
+    options: ["5Gi", "10Gi", "20Gi", "50Gi"]
+    default: "10Gi"
+
+  - name: jwt_signing_key
+    type: Secret
+    label: JWT Signing Key
+    generate: true
+    generateLength: 64
+
+  - name: secrets_key
+    type: Secret
+    label: Secrets Encryption Key
+    generate: true
+    generateLength: 32
+
+  - name: license_base64
+    type: Secret
+    label: License File
+    description: License JSON. Delivered to the pod as a file, never as an env var.
+    default: ""
+
+  - name: oidc_enabled
+    type: Boolean
+    label: Enable OIDC Sign-in
+    default: "false"
+    advanced: true
+
+  - name: oidc_display_name
+    type: String
+    label: OIDC Display Name
+    default: ""
+    advanced: true
+
+  - name: oidc_authority
+    type: String
+    label: OIDC Authority
+    default: ""
+    advanced: true
+
+  - name: oidc_client_id
+    type: String
+    label: OIDC Client ID
+    default: ""
+    advanced: true
+
+  - name: oidc_client_secret
+    type: Secret
+    label: OIDC Client Secret
+    default: ""
+    advanced: true
+
+  # Derived, for the same reason as supabase's: each embeds the password and is
+  # as sensitive as it, so it belongs in the vault rather than the document.
+  - name: connectionstring_metadata
+    type: Secret
+    label: Metadata Connection String
+    derived: "Host=[%db_host%];Port=[%db_port%];Database=[%db_name%];Username=[%db_user%];Password=[%db_password%]"
+
+  - name: connectionstring_lake
+    type: Secret
+    label: Lake Connection String
+    derived: "Host=[%db_host%];Port=[%db_port%];Database=[%db_name%];Username=[%db_user%];Password=[%db_password%]"
+
+  - name: ingress_host
+    type: String
+    label: Public Hostname
+    default: "[%name%].{{domain_suffix}}"
+
+  - name: ingress_certificate_issuer
+    type: String
+    label: Certificate Issuer
+    default: "{{cert_issuer}}"
+    advanced: true
+
+outputs:
+  - name: app_url
+    label: Application URL
+    type: Url
+    value: "https://[%ingress_host%]/"
+  - name: published_api_url
+    label: Published API base
+    type: Url
+    value: "https://[%ingress_host%]/datalager"
+
+instance:
+  components:
+    - name: postgres
+      # Dropped entirely when the user brings their own database. The endpoint
+      # and env wiring below reference it by hostname parameter, which they
+      # then point elsewhere.
+      condition: bundled_database
+      startupOrder: 1
+      replicas: 1
+      runAsUser: 70
+      runAsGroup: 70
+      computePlan: small
+      containers:
+        - name: postgres
+          image: postgres
+          tag: "17-alpine"
+          ports:
+            - name: postgres
+              port: 5432
+          env:
+            - name: POSTGRES_DB
+              value: "[%db_name%]"
+            - name: POSTGRES_USER
+              value: "[%db_user%]"
+            - name: POSTGRES_PASSWORD
+              secretRef: { vault: "[%instance_vault%]", key: db_password }
+            - name: PGDATA
+              value: "/var/lib/postgresql/data/pgdata"
+          probes:
+            # exec, not tcp: the socket accepts during initdb, and the API would
+            # start against a database that has no schema yet.
+            readiness:
+              type: exec
+              command: [pg_isready, -U, "[%db_user%]", -d, "[%db_name%]"]
+              initialDelaySeconds: 10
+              periodSeconds: 10
+              failureThreshold: 6
+            liveness:
+              type: exec
+              command: [pg_isready, -U, "[%db_user%]", -d, "[%db_name%]"]
+              initialDelaySeconds: 30
+              periodSeconds: 20
+              failureThreshold: 3
+          mounts:
+            - volume: data
+              path: /var/lib/postgresql/data
+      volumes:
+        - name: data
+          persistent:
+            size: "[%db_storage_size%]"
+            tier: standard
+            fsGroup: 70
+
+    - name: api
+      startupOrder: 2
+      replicas: 1
+      computePlan: small
+      containers:
+        - name: api
+          image: registry.stackship.se/datahub/api
+          tag: "[%image_tag%]"
+          ports:
+            - name: http
+              port: 8080
+          env:
+            - name: ASPNETCORE_ENVIRONMENT
+              value: "Production"
+            - name: App__FrontendUrl
+              value: "https://[%ingress_host%]"
+            - name: App__PublicApiBaseUrl
+              value: "https://[%ingress_host%]/datalager"
+            - name: App__SeedDemoData
+              value: "false"
+            - name: License__Path
+              value: "/etc/stackship/license/license.json"
+            - name: Uploads__Path
+              value: "/app/data/uploads"
+            - name: Inbound__Path
+              value: "/app/data/inkommande"
+            - name: ConnectionStrings__Metadata
+              secretRef: { vault: "[%instance_vault%]", key: connectionstring_metadata }
+            - name: ConnectionStrings__Lake
+              secretRef: { vault: "[%instance_vault%]", key: connectionstring_lake }
+            - name: Jwt__SigningKey
+              secretRef: { vault: "[%instance_vault%]", key: jwt_signing_key }
+            - name: Secrets__Key
+              secretRef: { vault: "[%instance_vault%]", key: secrets_key }
+            - name: Oidc__Enabled
+              value: "[%oidc_enabled%]"
+            - name: Oidc__DisplayName
+              value: "[%oidc_display_name%]"
+            - name: Oidc__Authority
+              value: "[%oidc_authority%]"
+            - name: Oidc__ClientId
+              value: "[%oidc_client_id%]"
+            - name: Oidc__ClientSecret
+              secretRef: { vault: "[%instance_vault%]", key: oidc_client_secret }
+          probes:
+            readiness:
+              type: http
+              port: http
+              path: /health
+              initialDelaySeconds: 10
+              periodSeconds: 10
+              failureThreshold: 6
+            liveness:
+              type: http
+              port: http
+              path: /health
+              initialDelaySeconds: 30
+              periodSeconds: 20
+              failureThreshold: 3
+          mounts:
+            - volume: data
+              path: /app/data
+            - volume: license
+              path: /etc/stackship/license
+              readOnly: true
+      volumes:
+        - name: data
+          persistent:
+            size: "[%file_storage_size%]"
+            tier: standard
+            fsGroup: 10001
+        - name: license
+          files:
+            # sensitive: the license is licensed material, so it lands in a
+            # Secret and reads back redacted rather than in a ConfigMap.
+            sensitive: true
+            content:
+              license.json: "[%license_base64%]"
+
+    - name: web
+      startupOrder: 3
+      replicas: 1
+      computePlan: small
+      containers:
+        - name: web
+          image: registry.stackship.se/datahub/web
+          tag: "[%image_tag%]"
+          ports:
+            - name: http
+              port: 80
+          probes:
+            readiness:
+              type: http
+              port: http
+              path: /
+              initialDelaySeconds: 5
+              periodSeconds: 10
+              failureThreshold: 6
+            liveness:
+              type: http
+              port: http
+              path: /
+              initialDelaySeconds: 15
+              periodSeconds: 20
+              failureThreshold: 3
+
+  endpoints:
+    # One hostname, two backends. The web image is built with an empty
+    # VITE_API_URL precisely so the frontend calls the origin it was served
+    # from, which only works if both sit on the same host.
+    - name: api
+      component: api
+      port: http
+      expose: ingress
+      hostname: "[%ingress_host%]"
+      paths: ["/api", "/datalager", "/signin-oidc", "/health"]
+      issuer: "[%ingress_certificate_issuer%]"
+
+    - name: web
+      component: web
+      port: http
+      expose: ingress
+      hostname: "[%ingress_host%]"
+      paths: ["/"]
+      issuer: "[%ingress_certificate_issuer%]"
