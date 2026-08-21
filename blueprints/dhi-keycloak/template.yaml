@@ -34,6 +34,13 @@ kind: BlueprintTemplate
 # `kc.sh build --db=postgres`, which is a derived image and so a different
 # blueprint.
 #
+# The instance is clusterable, which is worth saying because the obvious reading
+# of a Kubernetes Keycloak is that it is not. Its session cache discovers peers
+# through the database (`jdbc-ping`) rather than through a headless Service, so
+# the usual blocker — no Service to run DNS_PING against — does not apply.
+# `replicas` cannot be a template parameter, so it ships at 1; raise it in the
+# component sheet afterwards and sessions survive.
+#
 # The database is a bundled PostgreSQL rather than a declared managed `postgres`
 # resource. Not preference: a managed resource exposes only `connectionString`
 # (ADO.NET key=value) and `uri` to the vault, and Keycloak needs host, port,
@@ -88,7 +95,8 @@ parameters:
     description: >-
       Keycloak is a JVM service that re-augments itself on every pod start.
       Below "large" that augmentation is CPU-starved and first start takes
-      minutes; "medium" is the floor, not a recommendation.
+      minutes; "medium" is the floor, not a recommendation. The heap follows
+      whichever plan you pick, so this is the memory setting too.
     options: ["large", "medium"]
     default: "large"
 
@@ -257,12 +265,15 @@ instance:
             fsGroup: 70
 
     - name: keycloak
+      # Wave 2, and that is the whole database-readiness story: a wave does not
+      # start until every component in the wave below it is READY, and postgres
+      # reports ready through pg_isready. No wait-for-db init container needed.
       startupOrder: 2
-      # Pinned at one, and the cache setting below is why. Keycloak clusters its
-      # session cache over JGroups, which needs a headless Service and a
-      # discovery protocol this platform does not give a component. A second
-      # replica with `cache=local` would not share sessions, so a user would be
-      # logged in or out depending on which pod answered.
+      # One by default, but not one by necessity — scale it in the component
+      # sheet and sessions follow, because of the cache stack configured below.
+      # `replicas` cannot be a parameter: substitution walks typed fields and
+      # only rewrites strings, and this is an int. It is also excluded from the
+      # pod-affecting hash, so changing it later scales without rolling pods.
       replicas: 1
       runAsUser: 65532
       runAsGroup: 65532
@@ -277,6 +288,13 @@ instance:
           # see the note at the top of this file.
           command: [/opt/keycloak/bin/kc.sh]
           args: [start]
+          # No JAVA_OPTS here on purpose. kc.sh sizes the heap from the
+          # container's memory limit — MaxRAMPercentage=70 — but only when
+          # KC_RUN_IN_CONTAINER is true, and the DHI image sets exactly that in
+          # its own environment. Without it the fallback is a hard -Xmx512m,
+          # which would make the compute plan above almost meaningless. Setting
+          # JAVA_OPTS here would replace the whole set, not add to it; use
+          # JAVA_OPTS_APPEND if something ever needs adding.
           ports:
             - name: http
               port: 8080
@@ -316,9 +334,21 @@ instance:
               value: "true"
             - name: KC_METRICS_ENABLED
               value: "true"
-            # See the replica note above.
+
+            # Clustered session cache, discovering peers through the database
+            # rather than the network. JGroups' older stacks want a headless
+            # Service and DNS_PING or KUBE_PING, neither of which a component
+            # gets here — jdbc-ping instead keeps a membership table in the
+            # Keycloak database every replica already talks to, which is why
+            # this works with nothing but the connection settings above. It is
+            # Keycloak's own default from 26.1 and pinned here so a future
+            # default cannot move it silently. Peers then talk directly on 7800
+            # and 57800; the boundary's allow-same-boundary NetworkPolicy
+            # permits that, so no port needs declaring for it.
             - name: KC_CACHE
-              value: local
+              value: ispn
+            - name: KC_CACHE_STACK
+              value: jdbc-ping
 
             - name: KC_BOOTSTRAP_ADMIN_USERNAME
               value: "[%admin_username%]"
@@ -353,6 +383,12 @@ instance:
               failureThreshold: 3
 
   endpoints:
+    # If a login round-trip returns 502 from an nginx ingress controller, this
+    # is why: Keycloak's OIDC responses carry state in headers and cookies large
+    # enough to overrun the default 4k proxy buffer. The fix is
+    # `nginx.ingress.kubernetes.io/proxy-buffer-size: 128k`, which an endpoint
+    # cannot express — it has no annotations field — so it belongs to whoever
+    # configures the ingress controller, not to this file.
     - name: web
       component: keycloak
       port: http
