@@ -50,16 +50,24 @@ parameters:
     options: ["5Gi", "10Gi", "20Gi", "50Gi"]
     default: "10Gi"
 
+  # Both keys below are base64-decoded by the application before use, so they are generated
+  # as base64 rather than as a random string. Without generateSpec the generator falls back to
+  # an alphabet containing !@#$%^&* — not valid base64 — and the API fails at startup with
+  # "The input is not a valid Base-64 string". generateLength counts BYTES on this path.
   - name: jwt_signing_key
     type: Secret
     label: JWT Signing Key
     generate: true
+    # TokenService.BuildKey requires at least 32 bytes after decoding.
+    generateSpec: base64
     generateLength: 64
 
   - name: secrets_key
     type: Secret
     label: Secrets Encryption Key
     generate: true
+    # AesSecretProtector requires exactly 32 bytes (AES-256) after decoding.
+    generateSpec: base64
     generateLength: 32
 
   - name: license_base64
