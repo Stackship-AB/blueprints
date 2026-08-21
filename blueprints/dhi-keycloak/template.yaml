@@ -1,0 +1,361 @@
+apiVersion: blueprints.stackship.se/v2
+kind: BlueprintTemplate
+
+# Keycloak from the Docker Hardened Images catalog — dhi.io/keycloak, the
+# CIS-compliant Debian 13 runtime variant, zero known CVEs, signed provenance
+# and an SBOM. Four facts read off that image's published specification shape
+# almost everything below:
+#
+#   - ENTRYPOINT is /opt/keycloak/bin/kc.sh and CMD is `start --optimized`.
+#   - USER is 65532 (`nonroot`), and /opt/keycloak is chowned to it at build.
+#   - Ports 8080 (http), 8443 (https) and 9000 (management) are declared.
+#   - The image ships bash, so kc.sh — a shell script — really is the entrypoint;
+#     this is a minimal image, not a distroless one.
+#
+# Two of those need a decision rather than a transcription:
+#
+# `--optimized` is DROPPED. The image's own build step runs a bare `kc.sh build`
+# with no options set, so the augmentation baked into it carries Keycloak's
+# defaults — including `db=dev-file`, an H2 file database. `db` is a build-time
+# option, and Keycloak does not merely warn when a build-time option differs
+# from the baked one under `--optimized`: it refuses to start. So `args` is
+# `start` alone, which re-augments at boot with the settings below. That costs a
+# minute or two on first start of each pod, which is what the generous
+# startupProbe budget is for, and it is the only way to reach PostgreSQL from a
+# stock hardened image without building a derived one.
+#
+# The component is NOT marked `hardened`, and that is deliberate rather than an
+# oversight. `hardened: true` sets readOnlyRootFilesystem, and the re-augmenting
+# start above has to write its generated Quarkus application back into
+# /opt/keycloak. The security properties that matter are kept by other means:
+# runAsUser/runAsGroup pin the process to 65532, and the platform drops ALL
+# capabilities and forbids privilege escalation on every container regardless.
+# A blueprint that wanted the read-only root back would need an image built with
+# `kc.sh build --db=postgres`, which is a derived image and so a different
+# blueprint.
+#
+# The database is a bundled PostgreSQL rather than a declared managed `postgres`
+# resource. Not preference: a managed resource exposes only `connectionString`
+# (ADO.NET key=value) and `uri` to the vault, and Keycloak needs host, port,
+# database, username and password as five separate settings. A template has no
+# way to take a URI apart. Turning `bundled_database` off and pointing the
+# fields at an external server is the path to a database this blueprint does not
+# run — and the better one for production.
+
+metadata:
+  slug: dhi-keycloak
+  title: Keycloak (Docker Hardened Image)
+  description: >-
+    Keycloak identity and access management, running the Docker Hardened Image
+    build — a CIS-compliant, non-root, zero-CVE Debian 13 image with signed
+    provenance and a full SBOM. Provides OpenID Connect, OAuth 2.0 and SAML
+    single sign-on, user federation and fine-grained authorization.
+  version: "26.7.1"
+  category: Platforms
+  tags: [keycloak, identity, sso, oidc, oauth2, saml, auth, hardened, dhi]
+  documentation: https://www.keycloak.org/documentation
+
+parameters:
+  # dhi.io serves the hardened catalog to authenticated Docker subscribers only;
+  # an anonymous pull is a 401 even for images labelled entitlement=public. This
+  # names a private-registry deployment source in the boundary, and the deploy
+  # resolves it into an imagePullSecret AS THE DEPLOYING USER — naming someone
+  # else's source fails the authorization check rather than borrowing their
+  # credentials. Leave it empty only if the cluster already carries a default
+  # pull secret that covers dhi.io.
+  - name: registry_source
+    type: String
+    label: Registry Credentials
+    description: >-
+      Name of the deployment source holding a Docker subscription login for
+      dhi.io. Required unless the cluster already has a pull secret for it.
+    default: ""
+
+  - name: version
+    type: Select
+    label: Keycloak Version
+    description: >-
+      Tag on dhi.io/keycloak. The floating tags follow the hardened catalog's
+      rebuilds, which is how a patched base reaches you; pin the exact patch for
+      an installation that must not move on its own.
+    options: ["26.7.1", "26.7", "26"]
+    default: "26.7.1"
+    documentation: https://hub.docker.com/hardened-images/catalog/dhi/keycloak
+
+  - name: compute_plan
+    type: Select
+    label: Compute Plan
+    description: >-
+      Keycloak is a JVM service that re-augments itself on every pod start.
+      Below "large" that augmentation is CPU-starved and first start takes
+      minutes; "medium" is the floor, not a recommendation.
+    options: ["large", "medium"]
+    default: "large"
+
+  - name: admin_username
+    type: String
+    label: Admin Username
+    description: Bootstrap administrator, created on the very first start only.
+    default: "admin"
+
+  - name: admin_password
+    type: Secret
+    label: Admin Password
+    description: >-
+      Password for the bootstrap administrator. Auto-generated; read it from the
+      instance vault, and change it in the console once you are in.
+    generate: true
+    generateLength: 24
+
+  - name: bundled_database
+    type: Boolean
+    label: Deploy PostgreSQL
+    description: >-
+      Deploy a PostgreSQL 17 instance alongside Keycloak. Turn this off to point
+      at a database you run yourself and fill in the fields below.
+    default: "true"
+
+  - name: db_host
+    type: String
+    label: Database Host
+    description: Points at the bundled instance unless you supply your own.
+    default: "[%name%]-postgres"
+
+  - name: db_port
+    type: String
+    label: Database Port
+    default: "5432"
+    advanced: true
+
+  - name: db_name
+    type: String
+    label: Database Name
+    default: "keycloak"
+
+  - name: db_user
+    type: String
+    label: Database User
+    default: "keycloak"
+
+  - name: db_password
+    type: Secret
+    label: Database Password
+    description: Password for the Keycloak database role. Auto-generated.
+    generate: true
+    generateLength: 32
+
+  - name: db_storage_size
+    type: Select
+    label: Database Storage
+    description: Persistent volume for the bundled PostgreSQL. Ignored when you bring your own.
+    options: ["5Gi", "10Gi", "20Gi", "50Gi"]
+    default: "10Gi"
+
+  - name: ingress_host
+    type: String
+    label: Public Hostname
+    description: >-
+      Public hostname for the instance. Keycloak bakes this into the issuer of
+      every token it signs, so moving it later invalidates existing clients —
+      choose the name you intend to keep.
+    default: "[%name%].{{domain_suffix}}"
+
+  - name: ingress_certificate_issuer
+    type: String
+    label: Certificate Issuer
+    description: cert-manager ClusterIssuer name
+    default: "{{cert_issuer}}"
+    advanced: true
+
+outputs:
+  - name: console_url
+    label: Admin Console
+    description: Keycloak administration console
+    type: Url
+    value: "https://[%ingress_host%]/admin"
+  - name: account_url
+    label: Account Console
+    description: Self-service account console for users of the master realm
+    type: Url
+    value: "https://[%ingress_host%]/realms/master/account"
+  - name: issuer_url
+    label: Issuer (master realm)
+    description: OIDC issuer for the master realm; each realm you create gets its own
+    type: Url
+    value: "https://[%ingress_host%]/realms/master"
+  - name: discovery_url
+    label: OIDC Discovery
+    description: Point a relying party's OIDC authority at this
+    type: Url
+    value: "https://[%ingress_host%]/realms/master/.well-known/openid-configuration"
+  - name: admin_username
+    label: Admin Username
+    description: The bootstrap administrator; its password is in the instance vault
+    type: String
+    value: "[%admin_username%]"
+
+instance:
+  components:
+    - name: postgres
+      # Dropped entirely when the user brings their own database. Keycloak
+      # reaches it through db_host, which they then point elsewhere.
+      condition: bundled_database
+      startupOrder: 1
+      replicas: 1
+      runAsUser: 70
+      runAsGroup: 70
+      computePlan: small
+      containers:
+        - name: postgres
+          image: postgres
+          tag: "17-alpine"
+          # The image's own ENTRYPOINT and CMD, declared because they have to be:
+          # a container with a vault-backed env var runs through the secret-exec
+          # shim, and Kubernetes cannot PREPEND to an entrypoint — setting
+          # `command` replaces it. Omit these and POSTGRES_PASSWORD is resolved
+          # and then dropped, and the database comes up trusting everyone.
+          # Absolute, not PATH-relative: the shim execs this directly, and a
+          # bare name resolving is a property of the shim rather than of this
+          # file.
+          command: [/usr/local/bin/docker-entrypoint.sh]
+          args: [postgres]
+          ports:
+            - name: postgres
+              port: 5432
+          env:
+            - name: POSTGRES_DB
+              value: "[%db_name%]"
+            - name: POSTGRES_USER
+              value: "[%db_user%]"
+            - name: POSTGRES_PASSWORD
+              secretRef: { vault: "[%instance_vault%]", key: db_password }
+            - name: PGDATA
+              value: "/var/lib/postgresql/data/pgdata"
+          probes:
+            # exec, not tcp: the socket accepts during initdb, and Keycloak's
+            # own schema migration would start against a database with no roles.
+            readiness:
+              type: exec
+              command: [pg_isready, -U, "[%db_user%]", -d, "[%db_name%]"]
+              initialDelaySeconds: 10
+              periodSeconds: 10
+              failureThreshold: 6
+            liveness:
+              type: exec
+              command: [pg_isready, -U, "[%db_user%]", -d, "[%db_name%]"]
+              initialDelaySeconds: 30
+              periodSeconds: 20
+              failureThreshold: 3
+          mounts:
+            - volume: data
+              path: /var/lib/postgresql/data
+      volumes:
+        - name: data
+          persistent:
+            size: "[%db_storage_size%]"
+            tier: standard
+            fsGroup: 70
+
+    - name: keycloak
+      startupOrder: 2
+      # Pinned at one, and the cache setting below is why. Keycloak clusters its
+      # session cache over JGroups, which needs a headless Service and a
+      # discovery protocol this platform does not give a component. A second
+      # replica with `cache=local` would not share sessions, so a user would be
+      # logged in or out depending on which pod answered.
+      replicas: 1
+      runAsUser: 65532
+      runAsGroup: 65532
+      computePlan: "[%compute_plan%]"
+      containers:
+        - name: keycloak
+          image: dhi.io/keycloak
+          tag: "[%version%]"
+          sourceRef: "[%registry_source%]"
+          # The image's ENTRYPOINT verbatim — required for secret delivery, as on
+          # postgres above. `args` deliberately drops the image's `--optimized`;
+          # see the note at the top of this file.
+          command: [/opt/keycloak/bin/kc.sh]
+          args: [start]
+          ports:
+            - name: http
+              port: 8080
+            # Keycloak 26 serves /health and /metrics on a separate management
+            # port. It stays off the ingress below: readiness detail and a
+            # metrics scrape are not things to publish on the internet.
+            - name: management
+              port: 9000
+          env:
+            - name: KC_DB
+              value: postgres
+            - name: KC_DB_URL_HOST
+              value: "[%db_host%]"
+            - name: KC_DB_URL_PORT
+              value: "[%db_port%]"
+            - name: KC_DB_URL_DATABASE
+              value: "[%db_name%]"
+            - name: KC_DB_USERNAME
+              value: "[%db_user%]"
+            - name: KC_DB_PASSWORD
+              secretRef: { vault: "[%instance_vault%]", key: db_password }
+
+            # The full public URL, not a bare hostname: Keycloak derives the
+            # issuer and every redirect it hands a client from this, and behind
+            # a TLS-terminating ingress it cannot infer the scheme itself.
+            - name: KC_HOSTNAME
+              value: "https://[%ingress_host%]"
+            # TLS ends at the ingress, so the pod speaks plain HTTP and trusts
+            # the X-Forwarded-* headers the controller sets. Without
+            # KC_HTTP_ENABLED a production-mode start refuses to listen at all.
+            - name: KC_HTTP_ENABLED
+              value: "true"
+            - name: KC_PROXY_HEADERS
+              value: xforwarded
+
+            - name: KC_HEALTH_ENABLED
+              value: "true"
+            - name: KC_METRICS_ENABLED
+              value: "true"
+            # See the replica note above.
+            - name: KC_CACHE
+              value: local
+
+            - name: KC_BOOTSTRAP_ADMIN_USERNAME
+              value: "[%admin_username%]"
+            - name: KC_BOOTSTRAP_ADMIN_PASSWORD
+              secretRef: { vault: "[%instance_vault%]", key: admin_password }
+          probes:
+            # Three probes, and the startup one carries the whole cost of the
+            # non-optimized start: augmentation plus schema migration plus JVM
+            # warm-up. 5s x 60 = five minutes before Kubernetes gives up, and
+            # liveness does not run until this passes — a shorter budget here is
+            # a crash loop that looks like a broken image.
+            startup:
+              type: http
+              port: management
+              path: /health/started
+              initialDelaySeconds: 20
+              periodSeconds: 5
+              failureThreshold: 60
+            readiness:
+              type: http
+              port: management
+              path: /health/ready
+              periodSeconds: 10
+              timeoutSeconds: 5
+              failureThreshold: 3
+            liveness:
+              type: http
+              port: management
+              path: /health/live
+              periodSeconds: 20
+              timeoutSeconds: 5
+              failureThreshold: 3
+
+  endpoints:
+    - name: web
+      component: keycloak
+      port: http
+      expose: ingress
+      hostname: "[%ingress_host%]"
+      issuer: "[%ingress_certificate_issuer%]"
