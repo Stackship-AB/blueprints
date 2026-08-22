@@ -26,7 +26,7 @@ metadata:
     database, authentication, instant APIs, realtime subscriptions, storage, and
     Studio dashboard.
   version: "3.0"
-  category: Platforms
+  category: Databases
   tags: [supabase, database, auth, storage, realtime, api, postgres]
   documentation: https://supabase.com/docs/guides/self-hosting
 
