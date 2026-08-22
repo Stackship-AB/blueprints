@@ -1,0 +1,397 @@
+apiVersion: blueprints.stackship.se/v2
+kind: BlueprintTemplate
+
+# LiteLLM Proxy from the project's own non-root image,
+# ghcr.io/berriai/litellm-non_root. Four facts read off `docker inspect` of that
+# image shape most of what follows:
+#
+#   - ENTRYPOINT is /app/docker/prod_entrypoint.sh and CMD is ["--port", "4000"].
+#     The entrypoint is a short shell script that execs `litellm "$@"` (via
+#     ddtrace-run only when USE_DDTRACE is set), so the args below are the whole
+#     of what the proxy is told to do.
+#   - USER is 65534 (nobody). This is why the non-root variant is the image used
+#     here rather than ghcr.io/berriai/litellm, which runs as root: the two are
+#     built from the same source in the same release, and the non-root one is the
+#     one whose runtime paths (the prisma bake at /opt/prisma, /app/.cache) are
+#     group-0 readable and owned by that uid on purpose.
+#   - Port 4000 is declared, and serves the OpenAI-compatible API, the admin UI
+#     at /ui, and the unauthenticated health endpoints — one port, one ingress.
+#   - PRISMA_CLI_QUERY_ENGINE_TYPE=binary and PRISMA_OFFLINE_MODE=true are set in
+#     the image's own environment, which is what lets `prisma migrate deploy` run
+#     on a fresh database with no npm and no network. A cluster with no egress to
+#     the npm registry still starts.
+#
+# The component is NOT marked `hardened`, deliberately. `hardened: true` sets
+# readOnlyRootFilesystem, and the image deliberately gives the runtime uid a
+# writable HOME at /app with a cache under /app/.cache — XDG_CACHE_HOME is left
+# unset in the image precisely so caches land there. What that flag also buys is
+# kept by other means: runAsUser pins the process to the image's own uid 65534,
+# and the platform drops ALL capabilities and forbids privilege escalation on
+# every container regardless of it.
+#
+# It ships at one replica. LiteLLM runs happily as several against one database,
+# but budget and rate-limit counters are then only eventually consistent unless
+# the replicas share a Redis — so the honest default is one, and the second one
+# is a decision an operator makes together with a cache. `replicas` cannot be a
+# template parameter (substitution only rewrites strings, and this is an int);
+# raise it in the component sheet afterwards.
+#
+# ── On the database ──────────────────────────────────────────────────────────
+#
+# A Stackship-managed PostgreSQL, declared as a resource, exactly as
+# stackship-data-hub declares one. The platform provisions it, waits for it to
+# accept connections, and writes its connection details into the instance vault
+# before the containers below are created — so there is no bundled postgres pod
+# here with no backups, no failover and no upgrade path, and no wait-for-db
+# ordering to arrange either.
+#
+# LiteLLM takes the whole URL rather than the pieces, which is why this exposes
+# `uri` and not the five components Keycloak needs. The pieces are in fact the
+# trap here: LiteLLM will compose a URL from DATABASE_HOST/_USERNAME/_PASSWORD/
+# _NAME, but the CLI path that does it (construct_database_url_from_env_vars)
+# reads no port at all and pastes the host in verbatim. Handed a host and a port
+# separately, it would quietly build a URL pointing at 5432 — right by accident
+# today, wrong the day the platform moves a cluster off the default port.
+# DATABASE_URL takes the libpq URI whole, and Prisma accepts both the
+# `postgresql://` scheme CloudNativePG writes and the query parameters LiteLLM
+# appends to it for pool sizing.
+#
+# The proxy runs `prisma migrate deploy` itself on every start, so an upgrade is
+# a tag change and nothing else. There is no migration job to sequence.
+
+metadata:
+  slug: litellm
+  title: LiteLLM
+  description: >-
+    An OpenAI-compatible gateway in front of every model you use — OpenAI,
+    Anthropic, Bedrock, Vertex, Azure and a hundred more behind one API and one
+    set of keys. Issue virtual keys per team or per application, give each a
+    budget and a rate limit, and see what was spent on what.
+  version: "1.97.0"
+  category: AI
+  tags: [litellm, ai, llm, gateway, proxy, openai, anthropic, postgres]
+  documentation: https://docs.litellm.ai/docs/simple_proxy
+
+parameters:
+  - name: version
+    type: Select
+    label: LiteLLM Version
+    description: >-
+      Tag on ghcr.io/berriai/litellm-non_root. Pin an exact version for an
+      installation that must not move on its own; "main-stable" follows each
+      stable release, which is how a fix reaches you without an edit — and also
+      how a minor version reaches you without one.
+    options: ["v1.97.0", "v1.96.2", "main-stable"]
+    default: "v1.97.0"
+    documentation: https://github.com/BerriAI/litellm/pkgs/container/litellm-non_root
+
+  - name: compute_plan
+    type: Select
+    label: Compute Plan
+    description: >-
+      Memory decides this more than CPU. The proxy loads a provider SDK per
+      configured model family and holds an async connection pool per deployment,
+      so a busy gateway sits comfortably above what "medium" (1GB) allows once a
+      handful of providers are in play. Medium is fine for a small internal
+      gateway; large is the one to pick for anything fronting real traffic.
+    options: ["large", "medium"]
+    default: "large"
+
+  # ── Credentials ────────────────────────────────────────────────────────────
+  #
+  # Generated as base64 rather than as a random string, and the reason is where
+  # these values end up rather than anything cryptographic. The default
+  # generator's alphabet contains !@#$%^&*, and a master key carrying a `$` or a
+  # `!` is a key that breaks the moment someone pastes it into a shell or an .env
+  # file — which is the first thing anyone does with it. Base64's +/= are inert
+  # in both. generateLength counts BYTES on this path.
+  - name: master_key_material
+    type: Secret
+    label: Master Key Material
+    description: >-
+      Random material for the master key. The deployed key is this with LiteLLM's
+      conventional "sk-" prefix; read `master_key` from the instance vault.
+    generate: true
+    generateSpec: base64
+    generateLength: 24
+    advanced: true
+
+  - name: master_key
+    type: Secret
+    label: Master Key
+    description: >-
+      The proxy's root credential: it authenticates as admin on every management
+      route and is the key that mints all other keys. Issue virtual keys from the
+      admin UI for anything that actually calls the API, and keep this one for
+      administration. Read it from the instance vault.
+    # Derived rather than generated so it carries the "sk-" prefix every LiteLLM
+    # client and example assumes. A derived value is always recomputed from its
+    # inputs, so this field cannot be filled in directly — supply
+    # master_key_material above to bring your own key. Hidden behind "advanced"
+    # for exactly that reason: a box whose contents are discarded is worse than
+    # no box.
+    derived: "sk-[%master_key_material%]"
+    advanced: true
+
+  - name: salt_key
+    type: Secret
+    label: Salt Key
+    description: >-
+      Encrypts the provider API keys the proxy stores in its database. Losing or
+      changing it does not lock you out, but every stored provider credential
+      becomes undecryptable and has to be entered again — so it is generated once
+      here and left alone. Kept separate from the master key on purpose: rotating
+      the master key would otherwise strand everything encrypted under the old one.
+    generate: true
+    generateSpec: base64
+    generateLength: 32
+    advanced: true
+
+  - name: ui_username
+    type: String
+    label: Admin UI Username
+    description: Username for the admin console's built-in login.
+    default: "admin"
+
+  - name: ui_password
+    type: Secret
+    label: Admin UI Password
+    description: >-
+      Password for that login. Auto-generated; read it from the instance vault.
+      Set explicitly so the console does not fall back to accepting the master
+      key as its password — a credential that mints keys should not be the one
+      typed into a browser form every morning.
+    generate: true
+    generateLength: 24
+
+  # ── Database ───────────────────────────────────────────────────────────────
+
+  - name: db_availability
+    type: Select
+    label: Database
+    description: >-
+      A Stackship-managed PostgreSQL, with backups and the platform's own
+      upgrade path. High availability runs three instances so the loss of a
+      node promotes a replica instead of taking the database down.
+    options: ["Single Instance", "High Available"]
+    default: "Single Instance"
+
+  - name: db_storage_size
+    type: Select
+    label: Database Storage
+    description: >-
+      Volume for the managed PostgreSQL. Keys, teams and budgets are tiny; what
+      grows is the request log, one row per call with its token counts and cost.
+    options: ["5Gi", "10Gi", "20Gi", "50Gi"]
+    default: "10Gi"
+
+  # ── Everything else ────────────────────────────────────────────────────────
+
+  - name: log_level
+    type: Select
+    label: Log Level
+    description: >-
+      Set explicitly because the image's own default for the log handler is
+      DEBUG, which on a gateway means request and response detail in the pod log.
+      INFO is the level to run at; DEBUG is for reproducing something.
+    options: ["INFO", "DEBUG", "WARNING", "ERROR"]
+    default: "INFO"
+    advanced: true
+
+  - name: ingress_host
+    type: String
+    label: Public Hostname
+    description: >-
+      Public hostname for the gateway. Every client's base URL points here, so
+      moving it later means editing every caller — choose the name you intend
+      to keep.
+    default: "[%name%].{{domain_suffix}}"
+
+  - name: ingress_certificate_issuer
+    type: String
+    label: Certificate Issuer
+    description: cert-manager ClusterIssuer name
+    default: "{{cert_issuer}}"
+    advanced: true
+
+outputs:
+  - name: api_base_url
+    label: API Base URL
+    description: >-
+      Point an OpenAI-compatible client's base URL here. Both /chat/completions
+      and /v1/chat/completions are served, so a client that insists on the /v1
+      suffix can have it.
+    type: Url
+    value: "https://[%ingress_host%]"
+  - name: admin_ui_url
+    label: Admin Console
+    description: Add models, issue virtual keys, set budgets, read the spend log
+    type: Url
+    value: "https://[%ingress_host%]/ui"
+  - name: api_docs_url
+    label: API Reference
+    description: The proxy's own OpenAPI documentation, generated from what it serves
+    type: Url
+    value: "https://[%ingress_host%]/docs"
+  - name: ui_username
+    label: Admin UI Username
+    description: Its password is in the instance vault
+    type: String
+    value: "[%ui_username%]"
+
+# The database, provisioned by the platform rather than run as a container here.
+# `name: db` makes the cluster {instance}-db, scoped to this instance so two
+# deployments of this blueprint into one resource group cannot silently share
+# one database.
+resources:
+  - name: db
+    type: postgres
+    availability: "[%db_availability%]"
+    storage: "[%db_storage_size%]"
+    exposes:
+      # The libpq URI, whole. It embeds the password, which is why it travels
+      # through the vault rather than being substituted into the spec — an
+      # env.value would leave it in plaintext in the CR for every holder of
+      # containerinstance/read.
+      - output: uri
+        vaultKey: database_url
+
+instance:
+  components:
+    - name: litellm
+      # The only component. Database readiness is not this file's problem: the
+      # platform provisions the declared resource and polls it until it accepts
+      # connections BEFORE the instance is created, so the proxy has never yet
+      # been started against a cluster still running initdb.
+      startupOrder: 1
+      replicas: 1
+      # The image's own uid. Its gid is deliberately left alone: the image gives
+      # group 0 read and write on the prisma installation and the bundled UI
+      # assets, and pinning a group here would take that away.
+      runAsUser: 65534
+      computePlan: "[%compute_plan%]"
+      containers:
+        - name: litellm
+          image: ghcr.io/berriai/litellm-non_root
+          tag: "[%version%]"
+          # The image's ENTRYPOINT and CMD verbatim. Declaring them is not
+          # decorative: a container with a vault-backed env var runs through the
+          # secret-exec shim, and Kubernetes cannot PREPEND to an entrypoint —
+          # setting `command` replaces it. Omit these and DATABASE_URL, the
+          # master key, the salt key and the UI password are all resolved and
+          # then silently dropped, and the proxy comes up with no database and
+          # no authentication.
+          command: [/app/docker/prod_entrypoint.sh]
+          args: ["--port", "4000"]
+          ports:
+            - name: http
+              port: 4000
+          env:
+            # The whole URL, from the vault. The proxy runs `prisma migrate
+            # deploy` against it before it opens a port, so the schema is
+            # created on first start and migrated on every upgrade.
+            - name: DATABASE_URL
+              secretRef: { vault: "[%instance_vault%]", key: database_url }
+
+            - name: LITELLM_MASTER_KEY
+              secretRef: { vault: "[%instance_vault%]", key: master_key }
+            - name: LITELLM_SALT_KEY
+              secretRef: { vault: "[%instance_vault%]", key: salt_key }
+
+            - name: UI_USERNAME
+              value: "[%ui_username%]"
+            - name: UI_PASSWORD
+              secretRef: { vault: "[%instance_vault%]", key: ui_password }
+
+            # Models live in the database, not in a config file. This is what
+            # makes the admin console's model editor work at all, and it is the
+            # reason this template ships no config.yaml: a file baked into the
+            # blueprint could only be changed by redeploying it, whereas a model
+            # added here survives a restart and an upgrade without one.
+            - name: STORE_MODEL_IN_DB
+              value: "True"
+
+            - name: LITELLM_LOG
+              value: "[%log_level%]"
+
+            # Where the two human-facing pages live. Left alone, LiteLLM serves
+            # its Swagger UI at the root — so the first thing anyone who opens
+            # the hostname in a browser meets is an API reference, and the admin
+            # console is somewhere they have to be told about. Moving the
+            # reference to /docs and redirecting the root to /ui costs the API
+            # nothing (only GET / is affected; /chat/completions and the rest are
+            # untouched) and makes the hostname mean what a person expects.
+            - name: DOCS_URL
+              value: "/docs"
+            - name: ROOT_REDIRECT_URL
+              value: "/ui"
+
+            # Not set here, and each for a reason worth knowing:
+            #
+            #   LITELLM_LICENSE — the enterprise license. An EMPTY value is not
+            #     the same as an absent one: the license check treats "" as a
+            #     license to verify and calls out to LiteLLM's licensing API at
+            #     startup. A template cannot make one env var conditional, so
+            #     this one is added in the component sheet by whoever has a
+            #     license.
+            #   GENERIC_CLIENT_ID / _SECRET and friends — SSO for the admin
+            #     console. Free for up to five billable users, enterprise beyond
+            #     that; the same empty-string problem applies, so it is also a
+            #     post-deploy addition. The Keycloak blueprint in this catalog
+            #     is a fine provider for it.
+            #   REDIS_* — shared budget and rate-limit state. Only meaningful
+            #     with more than one replica, which this ships without.
+          probes:
+            # Liveliness, not readiness, for the startup gate: readiness reports
+            # the database, and during the first start the migration is still
+            # running, so gating startup on it would fail the pod for doing
+            # exactly what it should be doing. Five minutes because a cold node
+            # pulling a large image onto a throttled CPU, then migrating a fresh
+            # database, is a different story from the ten seconds this takes
+            # warm — a budget that is merely typical turns a slow first boot
+            # into a crash loop that reads as a broken image.
+            startup:
+              type: http
+              port: http
+              path: /health/liveliness
+              initialDelaySeconds: 15
+              periodSeconds: 5
+              failureThreshold: 60
+            # This one DOES report the database: it answers 503 while the
+            # connection is down, so a pod that loses its database stops being
+            # sent traffic instead of answering every request with an error.
+            readiness:
+              type: http
+              port: http
+              path: /health/readiness
+              periodSeconds: 10
+              timeoutSeconds: 5
+              failureThreshold: 3
+            # Deliberately not /health/readiness: a database outage should take
+            # the pod out of the load balancer, not restart it in a loop.
+            liveness:
+              type: http
+              port: http
+              path: /health/liveliness
+              periodSeconds: 20
+              timeoutSeconds: 5
+              failureThreshold: 3
+
+  endpoints:
+    # One hostname, everything on it: the OpenAI-compatible API on its own paths
+    # (/chat/completions and /v1/chat/completions, /models, /embeddings and the
+    # rest), the admin console at /ui, the API reference at /docs. The health
+    # endpoints are on it too and are unauthenticated by design —
+    # /health/readiness answers `{"status", "db"}` and nothing else, which is
+    # what makes it safe for a load balancer to read.
+    #
+    # Note what is NOT gated here. Every route worth protecting checks the
+    # master key or a virtual key itself; `authGuard` in front of the whole host
+    # would break every API client, since an SDK sends a bearer token and cannot
+    # complete an interactive sign-in.
+    - name: web
+      component: litellm
+      port: http
+      expose: ingress
+      hostname: "[%ingress_host%]"
+      issuer: "[%ingress_certificate_issuer%]"
