@@ -1,0 +1,363 @@
+apiVersion: blueprints.stackship.se/v2
+kind: BlueprintTemplate
+
+# Stalwart 0.16, on a managed PostgreSQL rather than the bundled RocksDB the
+# Docker page reaches for. Three things about this deployment are not obvious
+# from https://stalw.art/docs/install/platform/docker/, and each one shapes the
+# file below.
+#
+# 1. THE MAIL PORTS ARE NOT PUBLISHED, AND CANNOT BE.
+#
+#    Every listener Stalwart seeds on first start except two is below 1024 —
+#    25 (SMTP), 465 (submissions), 993 (IMAPS), 995 (POP3S) and 443 (HTTPS).
+#    Binding those needs CAP_NET_BIND_SERVICE, and the container-instance
+#    operator drops ALL capabilities as an unconditional floor and sets
+#    allowPrivilegeEscalation=false, which also disables the file capability the
+#    image sets on the binary (`setcap cap_net_bind_service=+ep`). Neither the
+#    template format nor the instance spec can ask for the capability back, or
+#    for the net.ipv4.ip_unprivileged_port_start sysctl that would make the
+#    question moot. Running as uid 0 does not help: an empty bounding set is
+#    empty for root too.
+#
+#    Stalwart survives this. bind_and_drop_priv records a per-listener build
+#    error and carries on, so the two unprivileged listeners it seeds — http on
+#    8080 and ManageSieve on 4190 — come up and the rest are reported as failed
+#    in the admin UI's startup errors.
+#
+#    So what this blueprint deploys is Stalwart's HTTP half: the admin console,
+#    JMAP, CalDAV, CardDAV, WebDAV and the autoconfig/autodiscover endpoints,
+#    all behind the platform ingress on the one listener that can bind. SMTP,
+#    IMAP and POP3 are not reachable. That is a real limitation and not a
+#    configuration mistake — see the note at the bottom of this file for the two
+#    platform changes that would lift it.
+#
+#    ManageSieve (4190) would bind, and could be published with an
+#    `expose: loadBalancer` endpoint. It is left out because ManageSieve without
+#    IMAP is a script editor for a mailbox nothing can reach, and every
+#    loadBalancer endpoint costs its own external IP (the operator builds one
+#    Service of type LoadBalancer per endpoint, carrying exactly one port).
+#
+# 2. THE DATA STORE IS CONFIGURED BY AN INIT CONTAINER, NOT BY A files VOLUME.
+#
+#    Stalwart 0.16 reads one small JSON file at startup naming where its
+#    database lives; everything else lives in that database. The obvious way to
+#    deliver it is a `files` volume — except the file has to carry the managed
+#    cluster's host, port, database and username, and those are only known after
+#    CloudNativePG has bootstrapped. They arrive in the instance vault, and a
+#    vault value can only reach a container as an env var. `read_data_store`
+#    does a plain serde_json::from_str with no macro expansion, so the file
+#    cannot reference the environment either — only `authSecret` can, because
+#    that one field is a SecretKeyOptional and is resolved later when the store
+#    is opened.
+#
+#    Hence the init container: it holds the four non-secret values as vault-
+#    backed env vars, writes them into config.json on a shared emptyDir, and
+#    leaves the password out of the file entirely — the main container gets it
+#    as STALWART_DB_PASSWORD and config.json points at the variable by name.
+#    The password is therefore never written to a filesystem at all.
+#
+# 3. NO SETUP WIZARD, AND NO PERSISTENT VOLUME.
+#
+#    The wizard the Docker page describes is bootstrap mode, which Stalwart
+#    enters only when config.json is absent. With the file present it starts
+#    normally, finds an empty database, and seeds its own defaults (listeners,
+#    ASN tables, and the rest). STALWART_RECOVERY_ADMIN then supplies a working
+#    administrator login instead of the temporary one that would otherwise be
+#    printed to the container log — setting it does NOT put the server in
+#    recovery mode, which is gated on STALWART_RECOVERY_MODE alone.
+#
+#    With PostgreSQL as the data store, /var/lib/stalwart holds nothing, so
+#    there is no persistent volume here. /etc/stalwart is an emptyDir the init
+#    container refills on every pod start; it is mounted writable rather than
+#    read-only because Stalwart rewrites config.json if someone changes the data
+#    store from the admin UI. Such a change does not survive a restart, which is
+#    the right outcome for a store this template owns.
+
+metadata:
+  slug: stalwart
+  title: Stalwart
+  description: >-
+    Stalwart is an all-in-one mail and collaboration server. This blueprint
+    deploys its HTTP services — admin console, JMAP, CalDAV, CardDAV and WebDAV —
+    on a Stackship-managed PostgreSQL. The SMTP, IMAP and POP3 listeners bind
+    privileged ports and are not reachable on this platform.
+  version: "0.16.18"
+  category: Platforms
+  tags: [stalwart, mail, jmap, caldav, carddav, webdav, groupware, collaboration]
+  documentation: https://stalw.art/docs/install/platform/docker/
+
+parameters:
+  - name: version
+    type: Select
+    label: Stalwart Version
+    description: >-
+      Stalwart release to run. Only the 0.16 line is offered: it is the first
+      that reads the JSON data-store file this template writes, and 0.15 and
+      earlier would ignore it and drop into the bootstrap wizard.
+    options: ["0.16.18", "0.16.17", "0.16.16"]
+    default: "0.16.18"
+
+  - name: db_availability
+    type: Select
+    label: Database
+    description: >-
+      A Stackship-managed PostgreSQL, with backups and the platform's own
+      upgrade path. High availability runs three instances so the loss of a
+      node promotes a replica instead of taking the database down.
+    options: ["Single Instance", "High Available"]
+    default: "Single Instance"
+
+  - name: db_storage_size
+    type: Select
+    label: Database Storage
+    description: >-
+      Volume for the managed PostgreSQL. This holds everything — accounts,
+      configuration, message bodies and attachments — because with a SQL data
+      store and no separate blob store Stalwart keeps blobs in the database too.
+    options: ["10Gi", "20Gi", "50Gi", "100Gi"]
+    default: "20Gi"
+
+  - name: admin_username
+    type: String
+    label: Administrator Username
+    description: Login for the admin console at /admin.
+    default: "admin"
+
+  - name: admin_password
+    type: Secret
+    label: Administrator Password
+    description: >-
+      Password for the administrator account. Auto-generated, and readable
+      afterwards from the instance's secret vault under `admin_password`.
+    generate: true
+    generateLength: 32
+
+  # STALWART_RECOVERY_ADMIN takes one `username:password` string, so the two
+  # halves are composed here rather than in the container: the composed value
+  # embeds the password and is exactly as sensitive as it, which is what a
+  # derived Secret is for. Stalwart splits on the FIRST colon, so a generated
+  # password containing one is not a problem.
+  #
+  # Worth knowing: this credential is a standing fallback that bypasses the
+  # account directory, and upstream advises removing it once the server is set
+  # up. It is kept here because a blueprint has no second step in which to
+  # remove it, and an instance whose only administrator password was printed to
+  # a container log is worse. Clear it by redeploying without this variable once
+  # you have created a real administrator account.
+  - name: recovery_admin
+    type: Secret
+    label: Recovery Administrator Credential
+    description: The administrator login, in the `username:password` form Stalwart expects.
+    derived: "[%admin_username%]:[%admin_password%]"
+
+  - name: ingress_host
+    type: String
+    label: Public Hostname
+    description: >-
+      Public hostname for the instance, and the URL Stalwart publishes in its
+      JMAP and OAuth discovery documents. Defaults to the instance name under
+      the platform domain — override to use a custom domain.
+    default: "[%name%].{{domain_suffix}}"
+
+  - name: ingress_certificate_issuer
+    type: String
+    label: Certificate Issuer
+    description: cert-manager ClusterIssuer name
+    default: "{{cert_issuer}}"
+    advanced: true
+
+outputs:
+  - name: admin_url
+    label: Admin Console
+    description: Stalwart web administration interface
+    type: Url
+    value: "https://[%ingress_host%]/admin"
+  - name: jmap_url
+    label: JMAP Session
+    description: JMAP session resource for mail, calendar and contact clients
+    type: Url
+    value: "https://[%ingress_host%]/.well-known/jmap"
+  - name: caldav_url
+    label: CalDAV / CardDAV
+    description: DAV discovery endpoint for calendar and contact clients
+    type: Url
+    value: "https://[%ingress_host%]/.well-known/caldav"
+  - name: admin_username
+    label: Administrator Username
+    description: >-
+      Sign in with this at the admin console. The password is in the instance's
+      secret vault under `admin_password`.
+    type: String
+    value: "[%admin_username%]"
+
+# The database, provisioned by the platform rather than run as a container here.
+#
+# Five separate outputs rather than one connection string, because Stalwart's
+# data-store object takes the pieces one at a time and has no whole-URI form.
+# Four of them are read by the init container that writes config.json; the fifth
+# — the password — is read only by Stalwart itself, so it never lands in a file.
+resources:
+  - name: db
+    type: postgres
+    availability: "[%db_availability%]"
+    storage: "[%db_storage_size%]"
+    exposes:
+      - output: host
+        vaultKey: db_host
+      - output: port
+        vaultKey: db_port
+      - output: database
+        vaultKey: db_name
+      - output: username
+        vaultKey: db_username
+      - output: password
+        vaultKey: db_password
+
+instance:
+  components:
+    - name: stalwart
+      startupOrder: 1
+      replicas: 1
+      # medium (500m / 1Gi) rather than small: Stalwart holds a connection pool,
+      # a full-text index writer and the TLS acceptors in one process, and small
+      # (256Mi) is under what it settles at with an empty mailbox.
+      computePlan: medium
+
+      initContainers:
+        # Stalwart's own image, not a shell image: it already has /bin/sh, it
+        # runs as the same uid 2000 that owns /etc/stalwart, and reusing it means
+        # this component pulls exactly one image.
+        #
+        # The command is declared because it has to be. A container carrying a
+        # vault-backed env var is run through the secret-exec shim, Kubernetes
+        # cannot prepend to an entrypoint, and a container that declares neither
+        # command nor args is left unwrapped — which would leave every variable
+        # below unresolved and write a config.json full of empty strings.
+        - name: config
+          image: docker.io/stalwartlabs/stalwart
+          tag: "v[%version%]"
+          command: ["/bin/sh"]
+          args:
+            - "-c"
+            - |
+              set -eu
+              cat > /etc/stalwart/config.json <<JSON
+              {
+                "@type": "PostgreSql",
+                "host": "${STALWART_DB_HOST}",
+                "port": ${STALWART_DB_PORT:-5432},
+                "database": "${STALWART_DB_NAME}",
+                "authUsername": "${STALWART_DB_USERNAME}",
+                "authSecret": {
+                  "@type": "EnvironmentVariable",
+                  "variableName": "STALWART_DB_PASSWORD"
+                },
+                "useTls": true,
+                "allowInvalidCerts": true
+              }
+              JSON
+          env:
+            - name: STALWART_DB_HOST
+              secretRef: { vault: "[%instance_vault%]", key: db_host }
+            - name: STALWART_DB_PORT
+              secretRef: { vault: "[%instance_vault%]", key: db_port }
+            - name: STALWART_DB_NAME
+              secretRef: { vault: "[%instance_vault%]", key: db_name }
+            - name: STALWART_DB_USERNAME
+              secretRef: { vault: "[%instance_vault%]", key: db_username }
+          mounts:
+            - volume: config
+              path: /etc/stalwart
+
+      containers:
+        - name: stalwart
+          image: docker.io/stalwartlabs/stalwart
+          tag: "v[%version%]"
+          # The image's own ENTRYPOINT and CMD, restated so the secret-exec shim
+          # has an argv to wrap — see the init container above.
+          command: ["/usr/local/bin/stalwart"]
+          args: ["--config", "/etc/stalwart/config.json"]
+          ports:
+            # The one listener Stalwart seeds above 1024 that speaks HTTP. It is
+            # plaintext by design (tls_implicit is false on this listener), which
+            # is what lets the platform ingress terminate TLS in front of it.
+            - name: http
+              port: 8080
+          env:
+            # Without this the JMAP session resource, the OAuth metadata and the
+            # autoconfig documents advertise the pod's own hostname, and every
+            # client that follows discovery ends up pointed at an address that
+            # does not resolve.
+            - name: STALWART_PUBLIC_URL
+              value: "https://[%ingress_host%]"
+            # A pod's hostname is its pod name, which changes on every restart.
+            # Left alone, Stalwart would register a new node identity each time.
+            - name: STALWART_HOSTNAME
+              value: "[%ingress_host%]"
+            - name: STALWART_RECOVERY_ADMIN
+              secretRef: { vault: "[%instance_vault%]", key: recovery_admin }
+            # Named by config.json's authSecret, resolved when the store opens.
+            - name: STALWART_DB_PASSWORD
+              secretRef: { vault: "[%instance_vault%]", key: db_password }
+          probes:
+            readiness:
+              type: http
+              port: http
+              path: /healthz/ready
+              initialDelaySeconds: 10
+              periodSeconds: 10
+              failureThreshold: 6
+            liveness:
+              type: http
+              port: http
+              path: /healthz/live
+              initialDelaySeconds: 30
+              periodSeconds: 20
+              failureThreshold: 3
+          mounts:
+            - volume: config
+              path: /etc/stalwart
+
+      volumes:
+        # Not persistent: with PostgreSQL as the data store the only thing on
+        # disk is the file the init container writes, and it is rewritten on
+        # every pod start. Writable rather than read-only so Stalwart can
+        # rewrite it if the data store is changed from the admin UI.
+        - name: config
+          emptyDir:
+            sizeLimit: "1Mi"
+
+  endpoints:
+    # No authGuard. The admin console has its own login, and JMAP, CalDAV,
+    # CardDAV and the autoconfig endpoints are reached by clients that would
+    # have no way through a portal login — guarding this host would lock out
+    # every one of them to protect a UI that is already authenticated.
+    - name: web
+      component: stalwart
+      port: http
+      expose: ingress
+      hostname: "[%ingress_host%]"
+      paths: ["/"]
+      issuer: "[%ingress_certificate_issuer%]"
+      authGuard: false
+
+# WHAT WOULD MAKE THIS A MAIL SERVER
+#
+# Either of two platform changes would let the SMTP, IMAP and POP3 listeners be
+# published, and the second is the better one:
+#
+#   - Let a component opt into CAP_NET_BIND_SERVICE, or set
+#     net.ipv4.ip_unprivileged_port_start=0 on the pod. Both reopen a hole the
+#     capability floor was closed to keep shut, for one workload in the catalog.
+#
+#   - Let an endpoint name an external port distinct from the container port.
+#     ContainerInstanceServiceBuilder currently sets Port and TargetPort to the
+#     same number; separating them would let a Service publish 25 in front of a
+#     listener bound to 2525, with no capability granted to anything. It also
+#     answers the same question for every other image that hard-codes a
+#     privileged port.
+#
+# Publishing them would still cost one external IP per port, since each
+# loadBalancer endpoint becomes its own single-port Service — worth weighing
+# against sharing one address across the mail protocols, which needs MetalLB's
+# allow-shared-ip annotation and so a change of its own.
