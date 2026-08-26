@@ -1,0 +1,533 @@
+apiVersion: blueprints.stackship.se/v2
+kind: BlueprintTemplate
+
+# PostgREST from the project's own image, docker.io/postgrest/postgrest. Four
+# facts read off `docker inspect` and the image's single layer shape most of
+# what follows:
+#
+#   - There is NO ENTRYPOINT. CMD is ["/bin/postgrest"], so the `command` below
+#     is the whole of what this container runs.
+#   - USER is 1000 and port 3000 is declared.
+#   - The image is built with Nix and is 6MB of ONE layer: /bin/postgrest, a
+#     statically linked binary, plus openssl's etc/ssl. No shell, no coreutils,
+#     no /tmp, no libc, no CA bundle. Nothing in this template may assume a
+#     shell exists inside it — which is why every probe below is an HTTP probe
+#     and there is no exec anywhere.
+#   - It writes nothing to its filesystem, which is why this component IS
+#     marked `hardened` where Keycloak and LiteLLM in this catalog deliberately
+#     are not. There is nothing for readOnlyRootFilesystem to break, and the
+#     platform mounts a memory-backed /tmp alongside it regardless.
+#
+# Missing CA certificates is worth one line of its own, because it is the thing
+# that would bite: the platform's PostgreSQL enforces SSL through pg_hba, and
+# libpq's default `sslmode=prefer` negotiates TLS without verifying a chain. So
+# the connection below is encrypted and works with no trust store in the image.
+# Asking for verify-full would need a CA file mounted in.
+#
+# One replica. PostgREST is stateless — every request is a transaction against
+# the database and nothing is held between them — so this scales horizontally
+# with no coordination at all. `replicas` cannot be a template parameter
+# (substitution walks typed fields and only rewrites strings, and this is an
+# int); raise it in the component sheet and the second pod needs nothing else.
+#
+# ── On the database ──────────────────────────────────────────────────────────
+#
+# A Stackship-managed PostgreSQL, declared as a resource, exactly as LiteLLM and
+# Keycloak declare one. The platform provisions it, waits for it to accept
+# connections, and writes its connection details into the instance vault before
+# the container below is created — so there is no bundled postgres pod here with
+# no backups, no failover and no upgrade path, and no wait-for-db ordering to
+# arrange either.
+#
+# PostgREST takes the URI whole (`db-uri`), so this exposes `uri` and not the
+# five components Keycloak needs — and it is CloudNativePG's own `uri` key,
+# handed on verbatim. PostgREST passes it to libpq unmodified, so any character
+# reserved by the URI syntax that appears in the generated password has to be
+# percent-encoded inside it; a raw `@` would make libpq parse a different host.
+# If a deploy ever fails at "could not translate host name", that is where to
+# look first — and `connectionString`, the key=value form, is the exposure that
+# has no such syntax to trip over.
+#
+# ── On roles, and what this platform can and cannot do to a database ─────────
+#
+# PostgREST's security model is that it connects as one role — the
+# "authenticator" — and does `SET LOCAL ROLE` per request: to `db-anon-role` for
+# a request with no JWT, and to the JWT's `role` claim for one with. Upstream's
+# setup guide therefore starts with CREATE ROLE anon; GRANT anon TO
+# authenticator; and that guide cannot be followed here:
+#
+#   - The managed database's owner (CNPG's `app`) is a plain LOGIN role. It has
+#     no CREATEROLE, so it cannot create an `anon` role itself.
+#   - The platform's SQL editor refuses CREATE ROLE, GRANT, ALTER ROLE and
+#     ALTER DEFAULT PRIVILEGES outright — refusal code `unsafe.role`. CREATE
+#     TABLE, CREATE VIEW, CREATE FUNCTION (sql and plpgsql) and every DML
+#     statement are allowed; anything touching the role system is not.
+#
+# So this template does not pretend a role bootstrap happened. It ships the
+# database owner as the authenticator, `db-anon-role` EMPTY — anonymous requests
+# are refused with 401, which is PostgREST's own default and the only safe one
+# when the sole role that exists owns everything — and one generated bearer
+# token that works the moment the instance is up. The full path from deploy to
+# data is in the outputs.
+#
+# ── Making PostgREST notice a new table ──────────────────────────────────────
+#
+# PostgREST reads the schema — tables, views, functions, foreign keys — into a
+# cache at startup and does not poll for changes. A table created afterwards is
+# invisible until the cache is reloaded, and the answer to "my table 404s" is
+# nearly always this. Two ways, both available here:
+#
+#   - Append `SELECT pg_notify('pgrst', 'reload schema');` to the SAME editor
+#     batch as the DDL, and commit. It has to share the batch: the editor opens
+#     a read-only transaction for a batch of nothing but SELECTs, and pg_notify
+#     cannot run in one — next to a CREATE TABLE it can. A dry run is no good
+#     either, since a rolled-back notification is never delivered.
+#   - Or restart the component. Coarse, always available, and a few seconds:
+#     the image is 6MB and the cache is rebuilt on every start anyway.
+#
+# The same channel carries `reload config`; see `db_pre_config` below.
+
+metadata:
+  slug: postgrest
+  title: PostgREST
+  description: >-
+    A REST API served directly out of PostgreSQL. Point it at a schema and every
+    table, view and function in it becomes an endpoint — with filtering, ordering,
+    pagination, resource embedding across foreign keys and an OpenAPI description,
+    all enforced by the database's own permissions rather than by hand-written
+    code. Ships with a Stackship-managed PostgreSQL behind it.
+  version: "16.2"
+  category: Databases
+  tags: [postgrest, api, rest, postgres, database, openapi, jwt]
+  documentation: https://docs.postgrest.org/en/stable/
+
+parameters:
+  - name: version
+    type: Select
+    label: PostgREST Version
+    description: >-
+      Tag on docker.io/postgrest/postgrest. PostgREST numbers releases
+      MAJOR.PATCH and only ships even majors. v16 dropped support for PostgreSQL
+      13 and changed the syntax of one config value (jwt-role-claim-key, which
+      this template deliberately leaves at its default so the choice here is
+      safe either way); v14 is the previous series and still gets patches.
+    options: ["v16.2", "v16.1", "v14.17"]
+    default: "v16.2"
+    documentation: https://github.com/PostgREST/postgrest/blob/main/CHANGELOG.md
+
+  - name: compute_plan
+    type: Select
+    label: Compute Plan
+    description: >-
+      PostgREST is a single static binary holding a connection pool and buffering
+      one response at a time; it idles at a few tens of megabytes, so "small" is
+      a real answer and not a compromise. Move up when responses are large — the
+      row set is assembled in memory before it is sent — or when the pool below
+      is widened.
+    options: ["small", "medium", "large"]
+    default: "small"
+
+  # ── Credentials ────────────────────────────────────────────────────────────
+  #
+  # ORDER MATTERS BETWEEN THESE TWO. The generator resolves parameters in the
+  # order they are declared here, and signing a `jwt` parameter looks up the
+  # already-resolved value of the parameter named exactly `jwt_secret`. Move
+  # api_token above it and it is signed with a throwaway key instead — a token
+  # that looks perfectly well-formed and that this instance will reject.
+  - name: jwt_secret
+    type: Secret
+    label: JWT Secret
+    description: >-
+      The HMAC key PostgREST verifies bearer tokens with. Anyone holding it can
+      mint a token for any role, so it is as powerful as the database itself.
+      Generated as base64 for two reasons: the value is used VERBATIM as the
+      key (jwt-secret-is-base64 stays off, so what is stored is what a JWT
+      library must be handed), and the default generator's alphabet contains
+      !@#$%^&* — characters that break the moment someone pastes the secret into
+      a shell or an .env file, which is the first thing anyone does with it.
+      32 bytes encodes to 44 characters, comfortably over PostgREST's 32-character
+      minimum. Replace it with a JWK or JWKS document to verify RS256 tokens from
+      an external issuer instead — the Keycloak blueprint in this catalog is one;
+      note that PostgREST reads a key set from this value, never from a URL, so
+      the JSON has to be pasted in, and a Keycloak token carries its roles
+      somewhere other than a top-level `role` claim, which is what
+      PGRST_JWT_ROLE_CLAIM_KEY in the component sheet is for.
+    generate: true
+    generateSpec: base64
+    generateLength: 32
+
+  - name: api_token
+    type: Secret
+    label: API Token
+    description: >-
+      A ready-to-use bearer token, signed with the secret above and claiming the
+      database owner's role. This is what makes the instance usable the minute it
+      is up: `curl -H "Authorization: Bearer <this>" https://<host>/`. It carries
+      the owner's privileges — read and write on every table in the database —
+      and it is valid for ten years, so treat it as a root credential: use it to
+      get set up, and mint narrower, shorter-lived tokens with the same secret
+      once you have roles to name. Read it from the instance vault.
+    generate: true
+    generateSpec: jwt
+    generateClaims:
+      # `app` is not a guess and not configurable here. The platform creates the
+      # managed cluster without an initdb block, so CloudNativePG applies its own
+      # defaults — database `app`, owned by role `app` — and that owner is the
+      # role PostgREST connects as. It is also written to the vault as
+      # db_username by the resource below, so it can be checked rather than
+      # trusted. A JWT claiming any other role would need that role to exist and
+      # to be grantable to the owner, which on this platform it cannot be.
+      role: app
+    advanced: true
+
+  # ── What is exposed ────────────────────────────────────────────────────────
+
+  - name: db_schemas
+    type: String
+    label: Exposed Schemas
+    description: >-
+      Comma-separated schemas to publish. Everything in them that the requesting
+      role may see becomes an endpoint, so this is the blast radius: a schema of
+      views written for the purpose is the shape upstream recommends, and
+      `public` is the shape every tutorial assumes. The first entry is the
+      default; a client selects another with the Accept-Profile header.
+    default: "public"
+    documentation: https://docs.postgrest.org/en/stable/references/api/schemas.html
+
+  - name: db_anon_role
+    type: String
+    label: Anonymous Role
+    description: >-
+      Role for requests that arrive with no bearer token. EMPTY means anonymous
+      access is refused with 401, which is what you want here: the only role a
+      Stackship-managed database has is its owner, and naming it here would
+      publish every table read-write to anyone who can resolve the hostname.
+      Fill this in only once a restricted role exists to name — which needs
+      CREATE ROLE, and so a psql session as a role that has it; the platform's
+      SQL editor refuses role statements.
+    default: ""
+    advanced: true
+    documentation: https://docs.postgrest.org/en/stable/explanations/db_authz.html
+
+  # ── Database ───────────────────────────────────────────────────────────────
+
+  - name: db_availability
+    type: Select
+    label: Database
+    description: >-
+      A Stackship-managed PostgreSQL, with backups and the platform's own
+      upgrade path. High availability runs three instances so the loss of a
+      node promotes a replica instead of taking the database down.
+    options: ["Single Instance", "High Available"]
+    default: "Single Instance"
+
+  - name: db_storage_size
+    type: Select
+    label: Database Storage
+    description: >-
+      Volume for the managed PostgreSQL. This is your data, not PostgREST's —
+      PostgREST stores nothing of its own.
+    options: ["5Gi", "10Gi", "20Gi", "50Gi"]
+    default: "10Gi"
+
+  - name: db_pool
+    type: String
+    label: Connection Pool Size
+    description: >-
+      Connections PostgREST holds open. It is a ceiling on concurrent requests,
+      not a target, and it is charged against the database's max_connections —
+      so raising it here is only half of raising it. Ten is upstream's default
+      and enough for a lot of traffic, since a PostgREST request is a short
+      transaction.
+    default: "10"
+    advanced: true
+
+  - name: db_max_rows
+    type: String
+    label: Maximum Rows Per Response
+    description: >-
+      Hard cap on rows fetched for one request, applied whether or not the client
+      asked for a range. Set here where upstream leaves it unlimited, because
+      this endpoint is on the public internet and one `GET /big_table` should not
+      be able to pull a million rows through the pod. Truncation is visible to
+      the client in the Content-Range header rather than silent. Empty means
+      unlimited.
+    default: "1000"
+    advanced: true
+
+  - name: db_pre_config
+    type: String
+    label: Pre-config Function
+    description: >-
+      Schema-qualified function (e.g. public.postgrest_config) called on every
+      config load, whose set_config('pgrst.<setting>', ...) calls override the
+      settings on this page. This is the one way to reconfigure PostgREST from
+      inside the database on this platform: the usual route, ALTER ROLE ... SET
+      pgrst.*, is refused by the SQL editor, but CREATE FUNCTION in plpgsql is
+      allowed — and `SELECT pg_notify('pgrst', 'reload config');` alongside it
+      applies the result without a redeploy. Leave empty until the function
+      exists; naming one that does not is survivable (PostgREST logs the failed
+      read and carries on with the settings here) but it logs on every load.
+    default: ""
+    advanced: true
+    documentation: https://docs.postgrest.org/en/stable/references/configuration.html#db-pre-config
+
+  # ── Everything else ────────────────────────────────────────────────────────
+
+  - name: cors_allowed_origins
+    type: String
+    label: CORS Allowed Origins
+    description: >-
+      Comma-separated origins allowed to call this API from a browser. Empty is
+      PostgREST's default and permits any origin — which is not as alarming as it
+      reads, since a cross-origin request still needs a bearer token the other
+      site does not have, and CORS was never the thing keeping data safe. Name
+      your front-ends here anyway if you know them.
+    default: ""
+    advanced: true
+
+  - name: log_level
+    type: Select
+    label: Log Level
+    description: >-
+      Left at PostgREST's own default, "error", deliberately: "info" turns the
+      pod log into an access log, one line per request INCLUDING the query
+      string — and a PostgREST query string is a filter over your data, so it
+      routinely contains the values you would least like copied into a log
+      aggregator. Raise it while you are debugging a 401 or a 404, and put it
+      back.
+    options: ["error", "warn", "info", "debug", "crit"]
+    default: "error"
+    advanced: true
+
+  - name: ingress_host
+    type: String
+    label: Public Hostname
+    description: >-
+      Public hostname for the API. Every client's base URL points here, and it
+      is baked into the OpenAPI description this instance serves, so moving it
+      later means editing every caller.
+    default: "[%name%].{{domain_suffix}}"
+
+  - name: ingress_certificate_issuer
+    type: String
+    label: Certificate Issuer
+    description: cert-manager ClusterIssuer name
+    default: "{{cert_issuer}}"
+    advanced: true
+
+outputs:
+  - name: api_url
+    label: API Base URL
+    description: >-
+      The root of the API, and also its OpenAPI description — GET / returns the
+      spec for everything the requesting role is allowed to see. A table becomes
+      /<table>, a function becomes /rpc/<function>.
+    type: Url
+    value: "https://[%ingress_host%]/"
+  - name: api_role
+    label: Database Role
+    description: >-
+      The role PostgREST connects as and that the generated API token claims:
+      the owner of the managed database. Confirm it against db_username in the
+      instance vault; it is also the role that owns anything you create through
+      the platform's SQL editor.
+    type: String
+    value: "app"
+  - name: getting_started
+    label: First Request
+    description: >-
+      Read api_token from the instance vault and call the root — it answers with
+      an OpenAPI document that is empty until you create something. Then create a
+      table in the platform's SQL editor and append
+      `SELECT pg_notify('pgrst', 'reload schema');` to the same batch, and
+      GET /<table> serves it. Without a token every request is 401 by design.
+    type: String
+    value: "curl -H \"Authorization: Bearer $API_TOKEN\" https://[%ingress_host%]/"
+
+# The database, provisioned by the platform rather than run as a container here.
+# `name: db` makes the cluster {instance}-db, scoped to this instance so two
+# deployments of this blueprint into one resource group cannot silently share
+# one database.
+resources:
+  - name: db
+    type: postgres
+    availability: "[%db_availability%]"
+    storage: "[%db_storage_size%]"
+    exposes:
+      # The libpq URI, whole, because PostgREST's db-uri takes it whole. It
+      # embeds the password, which is why it travels through the vault rather
+      # than being substituted into the spec — an env.value would leave it in
+      # plaintext in the CR for every holder of containerinstance/read.
+      - output: uri
+        vaultKey: db_uri
+      # Not read by any container. It is here so the role name the API token
+      # claims can be verified against what the platform actually created,
+      # without anyone having to read a password to find out.
+      - output: username
+        vaultKey: db_username
+
+instance:
+  components:
+    - name: postgrest
+      # The only component. Database readiness is not this file's problem: the
+      # platform provisions the declared resource and polls it until it accepts
+      # connections BEFORE the instance is created, so PostgREST has never yet
+      # been started against a cluster still running initdb.
+      startupOrder: 1
+      replicas: 1
+      # Safe here, unlike anywhere else in this catalog: the image is a single
+      # static binary that writes nothing, so readOnlyRootFilesystem costs it
+      # nothing, and the operator adds a memory-backed /tmp anyway. runAsNonRoot
+      # is satisfied by the uid below, which is the image's own.
+      hardened: true
+      runAsUser: 1000
+      computePlan: "[%compute_plan%]"
+      containers:
+        - name: postgrest
+          image: docker.io/postgrest/postgrest
+          tag: "[%version%]"
+          # The image's CMD, restated as a command because it has no ENTRYPOINT
+          # and because a container carrying a vault-backed env var is run
+          # through the secret-exec shim. Kubernetes cannot PREPEND to an
+          # entrypoint — setting `command` replaces it — so a container the
+          # operator cannot see the argv of is left unwrapped, and the database
+          # URI and the JWT secret below would be resolved and then silently
+          # dropped. PostgREST with no db-uri falls back to "postgresql://" and
+          # tries to reach a local socket that does not exist in this image.
+          command: [/bin/postgrest]
+          ports:
+            - name: http
+              port: 3000
+            # The admin server. It carries /live, /ready, /metrics and a schema
+            # cache dump, and it stays off the ingress below — a readiness detail
+            # and a Prometheus scrape are not things to publish on the internet.
+            # It must differ from the API port; PostgREST refuses to start if the
+            # two are equal, rather than quietly picking one.
+            - name: admin
+              port: 3001
+          env:
+            # The whole URI, from the vault. PostgREST connects as the owner of
+            # the managed database, which is therefore the authenticator role:
+            # every request runs as whatever role it SETs into, and a request
+            # with no token sets into db-anon-role — empty by default, so 401.
+            - name: PGRST_DB_URI
+              secretRef: { vault: "[%instance_vault%]", key: db_uri }
+
+            - name: PGRST_DB_SCHEMAS
+              value: "[%db_schemas%]"
+            # Empty is genuinely "unset" and not "a role named empty string":
+            # PostgREST filters empty values out of every string setting before
+            # it parses them. The same is true of the four other possibly-empty
+            # settings below, which is why they can be plain parameters with no
+            # conditional machinery behind them.
+            - name: PGRST_DB_ANON_ROLE
+              value: "[%db_anon_role%]"
+
+            - name: PGRST_JWT_SECRET
+              secretRef: { vault: "[%instance_vault%]", key: jwt_secret }
+
+            - name: PGRST_DB_POOL
+              value: "[%db_pool%]"
+            - name: PGRST_DB_MAX_ROWS
+              value: "[%db_max_rows%]"
+            - name: PGRST_DB_PRE_CONFIG
+              value: "[%db_pre_config%]"
+
+            # Both ports named explicitly. 3000 is already PostgREST's default,
+            # but the port declarations above are what the Service and the probes
+            # are built from, and a default that moved in a future version would
+            # break them silently.
+            - name: PGRST_SERVER_PORT
+              value: "3000"
+            - name: PGRST_ADMIN_SERVER_PORT
+              value: "3001"
+
+            # What the OpenAPI document says its own server is. PostgREST sees
+            # the pod's address, not the hostname TLS was terminated at, so
+            # without this the spec advertises http://0.0.0.0:3000 and every
+            # client generated from it points at nothing.
+            - name: PGRST_OPENAPI_SERVER_PROXY_URI
+              value: "https://[%ingress_host%]"
+            # Declares the bearer scheme in that document, so a Swagger UI or a
+            # generated client has somewhere to put the token. Purely
+            # descriptive — it changes what the spec says, never what is
+            # enforced.
+            - name: PGRST_OPENAPI_SECURITY_ACTIVE
+              value: "true"
+
+            - name: PGRST_SERVER_CORS_ALLOWED_ORIGINS
+              value: "[%cors_allowed_origins%]"
+            - name: PGRST_LOG_LEVEL
+              value: "[%log_level%]"
+
+            # Not set here, and each for a reason worth knowing:
+            #
+            #   PGRST_JWT_SECRET_IS_BASE64 — off, so the 44-character secret is
+            #     used as-is. Turning it on would mean the real key is the 32
+            #     bytes it decodes to, and every client signing a token would
+            #     have to know that. The generated api_token is signed the
+            #     first way.
+            #   PGRST_JWT_ROLE_CLAIM_KEY — where in the token the role is found.
+            #     Its default reads a top-level `role` claim, which is what the
+            #     generated token carries. It is also the one setting whose
+            #     SYNTAX changed in v16 (`.role` became `$.role`), so leaving it
+            #     alone is what makes the version parameter above safe to move
+            #     in either direction. Set it in the component sheet when
+            #     accepting tokens from an external issuer.
+            #   PGRST_DB_CHANNEL_ENABLED — on by default, and it is what makes
+            #     `NOTIFY pgrst` reach this pod at all. Off would mean a restart
+            #     for every schema change.
+            #   PGRST_DB_PLAN_ENABLED — off. It lets a client ask for the query
+            #     plan of its own request, which is a fine debugging tool and a
+            #     fine way to describe your indexes to a stranger.
+          probes:
+            # /ready reports the connection pool and the schema cache: 200 when
+            # both are good, 503 while either is not. That is exactly the
+            # readiness question — a pod that cannot reach its database should
+            # stop being sent traffic — and it is also why it is NOT the liveness
+            # probe.
+            readiness:
+              type: http
+              port: admin
+              path: /ready
+              initialDelaySeconds: 3
+              periodSeconds: 10
+              timeoutSeconds: 5
+              failureThreshold: 3
+            # /live answers only "is the server thread alive and the socket
+            # open", with no database in the question. A database outage
+            # therefore takes this pod out of the load balancer and leaves it
+            # running to reconnect, instead of restarting it in a loop for a
+            # fault it is not the cause of.
+            #
+            # There is deliberately no startupProbe. Its usual job is to keep
+            # liveness from firing during a slow first start, and liveness here
+            # cannot fire for a slow start: the binary opens its socket in
+            # milliseconds and the part that takes time — reaching the database,
+            # loading the schema cache — is the part /live does not look at.
+            liveness:
+              type: http
+              port: admin
+              path: /live
+              initialDelaySeconds: 5
+              periodSeconds: 20
+              timeoutSeconds: 5
+              failureThreshold: 3
+
+  endpoints:
+    # One hostname, everything on it: the tables and views under /, the
+    # functions under /rpc, the OpenAPI description at the root.
+    #
+    # Note what is NOT here. `authGuard` would put the platform's interactive
+    # sign-in in front of the whole host, which no API client can complete — an
+    # SDK sends a bearer token and cannot follow a login redirect. Authentication
+    # here is PostgREST's own: a JWT, checked per request, resolved to a database
+    # role. The admin port is simply absent from this list, so nothing but the
+    # kubelet's probes ever reaches /metrics.
+    - name: api
+      component: postgrest
+      port: http
+      expose: ingress
+      hostname: "[%ingress_host%]"
+      issuer: "[%ingress_certificate_issuer%]"
