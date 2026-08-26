@@ -1,0 +1,345 @@
+apiVersion: blueprints.stackship.se/v2
+kind: BlueprintTemplate
+
+# Dragonfly from the project's own image, ghcr.io/dragonflydb/dragonfly. Note
+# that this is the CONTAINER image and not ghcr.io/dragonflydb/dragonfly/helm/
+# dragonfly, which is the Helm chart published to the same registry — a chart is
+# a package of Kubernetes manifests and there is nothing for a blueprint to run
+# in it. The chart is still the best single source for how upstream expects this
+# to be operated, and several decisions below are taken from it (and two against
+# it, each said so out loud).
+#
+# Everything in this file was checked by running the image rather than by
+# reading the documentation, because on three points the documentation and the
+# binary disagree. The findings, in the order they would bite:
+#
+#   1. DFLY_PASSWORD IS FATAL. It is the variable the upstream chart's
+#      `passwordFromSecret` sets and the one --requirepass's own help text
+#      recommends, and on v1.40.1 the process dies before it opens a port:
+#      "F dfly_main.cc:1058] unknown environment variable DFLY_PASSWORD".
+#      Dragonfly maps DFLY_<flag> onto its flags by EXACT name, and LOG(FATAL)s
+#      on any DFLY_ variable that is not one — and there is no flag called
+#      `password`. So the password below travels as DFLY_requirepass, spelled
+#      exactly as the flag is. The same rule is why no other DFLY_ variable
+#      appears here: a typo is not ignored, it is a crash loop.
+#
+#   2. IT WILL NOT RUN ON THE `small` PLAN. Dragonfly refuses to start unless
+#      maxmemory is at least 256MiB per io thread, and it derives both numbers
+#      from the container's own cgroup: maxmemory is 80% of the memory limit,
+#      and the thread count is ceil(cpu limit). On small (250m/256Mi) that is
+#      204.80MiB against one thread needing 256MiB, and it exits 1 with "There
+#      are 1 threads, so 256.00MiB are required. Exiting..." — measured, not
+#      inferred. medium (500m/1Gi → 819MiB, 1 thread) and large (2000m/4Gi →
+#      3.2GiB, 2 threads) both have room, so those are the only two offered.
+#
+#   3. IT MUST NOT RUN AS ROOT HERE. The image declares no USER, and its
+#      entrypoint reacts to being root by chowning /data and then dropping
+#      privileges with setpriv — both of which need capabilities the platform
+#      drops from every container. The container dies on
+#      "setpriv: setresuid failed: Operation not permitted", exit 127. Running
+#      as uid 999 (the image's own `dfly`, which already owns /data) skips that
+#      whole branch, so runAsUser below is load-bearing rather than hygiene.
+#
+# The component IS marked `hardened`, and that was measured too: with a
+# read-only root filesystem, a tmpfs /tmp and a writable /data it starts,
+# serves, snapshots and reloads normally. Logs go to stderr, so nothing tries
+# to write the /tmp/dragonfly.* files the banner mentions.
+#
+# ── On the data, and how much of it survives ─────────────────────────────────
+#
+# Dragonfly keeps everything in memory and snapshots to disk. This blueprint
+# gives it a persistent volume at /data and a snapshot schedule, so what is in
+# the store outlives a restart, an upgrade and a node failure — but it is a
+# snapshot, not a log: anything written since the last one is lost in a crash.
+#
+# Two things make that less alarming than it sounds. A graceful shutdown always
+# writes a snapshot first, and because this component has a persistent volume
+# the platform gives its Deployment the `Recreate` strategy — so an upgrade is
+# stop-then-start, the old pod snapshots on the way out and the new one loads
+# what it wrote. (That also means an upgrade is a brief outage rather than a
+# rolling one, which for a single-node store it was always going to be.) The
+# grace period is Kubernetes' default 30 seconds; a store large enough that a
+# snapshot does not finish inside it is a store worth revisiting this for.
+#
+# ── On replicas ──────────────────────────────────────────────────────────────
+#
+# One, and unlike everywhere else in this catalog that is not a default to raise
+# later. This is a single-node store with one volume: a second replica would be
+# a second, independent Dragonfly, and with a ReadWriteOnce volume it would not
+# schedule at all. Autoscaling is refused outright by the module validator
+# alongside a persistent volume, which is the right answer. Replication (a
+# second instance running REPLICAOF against this one) is a Dragonfly-level
+# arrangement between two instances, not a replica count.
+
+metadata:
+  slug: dragonfly
+  title: Dragonfly
+  description: >-
+    A drop-in replacement for Redis and Memcached that runs on all your cores
+    instead of one. Speaks the Redis protocol, so existing clients connect
+    unchanged — with vertical scaling to hundreds of gigabytes in a single
+    process, snapshots that do not fork, and no cluster to operate.
+  version: "1.40.1"
+  category: Databases
+  tags: [dragonfly, redis, valkey, memcached, cache, key-value, in-memory]
+  documentation: https://www.dragonflydb.io/docs
+
+parameters:
+  - name: version
+    type: Select
+    label: Dragonfly Version
+    description: >-
+      Tag on ghcr.io/dragonflydb/dragonfly. Pin an exact version for an
+      installation that must not move on its own — there is no floating stable
+      tag here worth using, since `latest` follows every release including the
+      one published an hour ago.
+    options: ["v1.40.1", "v1.39.0", "v1.38.1"]
+    default: "v1.40.1"
+    documentation: https://github.com/dragonflydb/dragonfly/releases
+
+  - name: compute_plan
+    type: Select
+    label: Compute Plan
+    description: >-
+      This is the single most consequential setting here, because it decides how
+      much data fits: Dragonfly sizes its own memory ceiling at 80% of the
+      container's limit and refuses to start below 256MiB per io thread. medium
+      (500m/1Gi) gives it one thread and about 819MiB to hold data in; large
+      (2000m/4Gi) gives it two threads and about 3.2GiB, and is where Dragonfly's
+      reason to exist — using every core — actually begins. `small` is not
+      offered because it does not start.
+    options: ["medium", "large"]
+    default: "medium"
+
+  - name: password
+    type: Secret
+    label: Password
+    description: >-
+      The AUTH password every client must send. Auto-generated; read it from the
+      instance vault. Generated as base64 rather than as a random string because
+      of where it ends up: a connection URL, a shell command, an .env file — and
+      the default generator's alphabet contains !@#$%^&*, which is exactly the
+      set of characters that breaks all three. There is no unauthenticated mode
+      in this blueprint on purpose: the Redis protocol has no transport security
+      of its own, so the password is the whole of the door.
+    generate: true
+    generateSpec: base64
+    generateLength: 24
+
+  - name: cache_mode
+    type: Boolean
+    label: Evict When Full
+    description: >-
+      What happens when the store reaches its memory ceiling. Off (the default,
+      and Dragonfly's own) means a write that does not fit is REFUSED with an
+      out-of-memory error and nothing already stored is touched — the right
+      answer when the data matters. On means Dragonfly starts evicting entries
+      as it approaches the ceiling, which is the right answer for a cache and
+      silent data loss for anything else. Choose it deliberately.
+    default: "false"
+
+  - name: storage_size
+    type: Select
+    label: Snapshot Storage
+    description: >-
+      Volume for snapshots at /data. It holds one snapshot, not a history — the
+      filename is fixed, so each save replaces the last — so a volume of roughly
+      twice the memory ceiling of the plan above is comfortable and anything
+      smaller than that ceiling is a save that fails when the store is full.
+    options: ["1Gi", "5Gi", "10Gi", "20Gi", "50Gi"]
+    default: "5Gi"
+
+  - name: snapshot_cron
+    type: String
+    label: Snapshot Schedule
+    description: >-
+      Crontab expression for periodic snapshots, e.g. "0 * * * *" hourly,
+      "*/15 * * * *" every quarter hour, "0 3 * * *" nightly. This is what
+      covers the crash case ONLY — a graceful stop, and so every upgrade and
+      every deliberate restart, snapshots regardless of what is set here. Empty
+      disables the schedule and leaves you with shutdown snapshots alone, which
+      for a pure cache is a perfectly sensible thing to want.
+    default: "0 * * * *"
+
+  - name: http_console
+    type: Boolean
+    label: HTTP Console and Metrics
+    description: >-
+      Dragonfly serves HTTP on the SAME port as the Redis protocol, and this
+      leaves that on. Worth knowing before you publish the port: /metrics
+      answers 200 with no credentials at all, while / and the rest of the
+      console do require the password — so an externally reachable instance
+      hands out its key count, memory use, connected clients and command stats
+      to anyone who asks. Turning this off closes the metrics endpoint along
+      with the console.
+    default: "true"
+    advanced: true
+
+  - name: expose_externally
+    type: Boolean
+    label: Reachable From Outside The Cluster
+    description: >-
+      Off by default, and worth leaving off. The instance is always reachable
+      inside the boundary at the address in the outputs, which is how another
+      instance in the same resource group should connect to it. Turning this on
+      allocates a LoadBalancer carrying port 6379 — the Redis protocol in the
+      clear, authenticated by a password and nothing else, with no TLS
+      terminating in front of it the way an HTTPS ingress would. Reach for it
+      for a developer connecting a laptop, not as the normal way in.
+    default: "false"
+
+outputs:
+  - name: host
+    label: Hostname
+    description: >-
+      In-cluster address of this instance. Any component in the same boundary
+      connects to it here; nothing outside can, unless the LoadBalancer above is
+      switched on, in which case its address appears alongside this one.
+    type: String
+    value: "[%name%]-dragonfly"
+  - name: port
+    label: Port
+    description: The Redis protocol, and the HTTP console on the same number
+    type: String
+    value: "6379"
+  - name: connect
+    label: Connect
+    description: >-
+      Read `password` from the instance vault and substitute it. Any Redis
+      client works unchanged — this is the protocol, not an imitation of it — so
+      a redis:// URL of the same shape is what most libraries want instead.
+    type: String
+    value: "redis-cli -h [%name%]-dragonfly -p 6379 -a $PASSWORD"
+
+instance:
+  components:
+    - name: dragonfly
+      # The name matters beyond this file: the ClusterIP Service is
+      # {instance}-{component}, so this is the second half of the hostname in
+      # the outputs above. Renaming it silently changes every client's address.
+      startupOrder: 1
+      # See the header — not a default to raise. One volume, one process, one
+      # copy of the data.
+      replicas: 1
+      # Verified against the image: read-only root filesystem, tmpfs /tmp,
+      # writable /data. It starts, serves, snapshots and reloads.
+      hardened: true
+      # The image's own `dfly`, which already owns /data. Without this the
+      # container runs as root, its entrypoint tries to chown and setpriv, and
+      # both fail against dropped capabilities — exit 127 before a port opens.
+      runAsUser: 999
+      computePlan: "[%compute_plan%]"
+      containers:
+        - name: dragonfly
+          image: ghcr.io/dragonflydb/dragonfly
+          tag: "[%version%]"
+          # The image's ENTRYPOINT verbatim, split from the flags so the flags
+          # can be parameterized. Declaring it is not decorative: a container
+          # carrying a vault-backed env var runs through the secret-exec shim,
+          # and Kubernetes cannot PREPEND to an entrypoint — setting `command`
+          # replaces it. Omit this and DFLY_requirepass below is resolved and
+          # then dropped, and the store comes up with no password at all.
+          #
+          # tini stays because the image put it there on purpose: Dragonfly's
+          # own healthcheck script spawns children, and PID 1 without an init
+          # leaves them as zombies (upstream issue #5844).
+          command: [/usr/bin/tini, --, entrypoint.sh]
+          args:
+            - dragonfly
+            - --logtostderr
+            # /data is already the image's WORKDIR and VOLUME; naming it is what
+            # makes the mount below load-bearing rather than incidental.
+            - --dir=/data
+            # A FIXED name, where the default is "dump-{timestamp}". The default
+            # writes a new pair of files on every save and deletes none of them,
+            # which on a fixed-size volume is a disk that fills up at whatever
+            # rate the schedule below runs. One name means each save replaces the
+            # last, and the volume holds one snapshot forever.
+            - --dbfilename=dump
+            - "--snapshot_cron=[%snapshot_cron%]"
+            - "--cache_mode=[%cache_mode%]"
+            - "--primary_port_http_enabled=[%http_console%]"
+            # Deliberately absent: --maxmemory. Left unset Dragonfly reads the
+            # container's cgroup limit and takes 80% of it, which is both correct
+            # and self-adjusting when the compute plan changes. Setting it here
+            # would mean a number that silently disagrees with the plan the next
+            # time someone moves from medium to large. Also absent: --bind (the
+            # protected-mode branch that would restrict it only triggers under
+            # systemd), --admin_port and --expose_http_api, both off by default
+            # and both a second way in.
+          env:
+            # Exactly `DFLY_` plus the flag's own name. DFLY_PASSWORD — the
+            # variable the upstream chart and the flag's help text both name —
+            # is fatal on this version; see the header.
+            - name: DFLY_requirepass
+              secretRef: { vault: "[%instance_vault%]", key: password }
+          ports:
+            - name: redis
+              port: 6379
+          probes:
+            # redis-cli ships in the image, and this is the whole check: it
+            # opens a connection, sends PING and exits 0 on any reply — PONG
+            # when there is no password, "NOAUTH Authentication required" when
+            # there is. It exits 1 only when nothing answers the port, which is
+            # exactly the question a probe is asking, and it gets there without
+            # the password appearing in the pod spec.
+            #
+            # Upstream's chart runs its own healthcheck.sh here, which shells
+            # out to netstat to discover the port and then pipes PING through
+            # nc. This is the same check with three fewer processes and no
+            # dependency on the script's `su dfly` fallback, which cannot work
+            # under dropped capabilities.
+            readiness:
+              type: exec
+              command: [/usr/bin/redis-cli, -p, "6379", ping]
+              initialDelaySeconds: 3
+              periodSeconds: 10
+              timeoutSeconds: 5
+              failureThreshold: 3
+            # A long threshold, and the reason is the snapshot: on start
+            # Dragonfly loads /data before it serves, and a large store takes
+            # as long as it takes. Five minutes of grace so a slow reload reads
+            # as a slow reload rather than as a crash loop.
+            startup:
+              type: exec
+              command: [/usr/bin/redis-cli, -p, "6379", ping]
+              initialDelaySeconds: 5
+              periodSeconds: 5
+              failureThreshold: 60
+            liveness:
+              type: exec
+              command: [/usr/bin/redis-cli, -p, "6379", ping]
+              periodSeconds: 20
+              timeoutSeconds: 5
+              failureThreshold: 3
+          mounts:
+            - volume: data
+              path: /data
+
+      volumes:
+        - name: data
+          persistent:
+            size: "[%storage_size%]"
+            tier: standard
+            # A fresh volume arrives empty and root-owned; the image's /data is
+            # owned by 999 but that ownership belongs to the image, not to the
+            # PVC mounted over it. fsGroup is what lets uid 999 write its
+            # snapshots — without it the first save fails with EACCES, which
+            # shows up as a store that runs perfectly and loses everything.
+            fsGroup: 999
+
+  endpoints:
+    # Absent unless asked for. A component that declares ports always gets its
+    # ClusterIP Service — that is the in-boundary address in the outputs, and it
+    # needs no endpoint — so this exists only to add a LoadBalancer on top.
+    #
+    # `expose: loadBalancer` rather than `ingress` because the Redis protocol is
+    # not HTTP: an ingress routes by hostname out of a TLS handshake this
+    # protocol never performs. That also means the platform's certificate and
+    # auth-guard machinery does not apply, and what protects the port is the
+    # password and the network in front of it.
+    - name: external
+      condition: expose_externally
+      component: dragonfly
+      port: redis
+      expose: loadBalancer
