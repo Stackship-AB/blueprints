@@ -1,0 +1,508 @@
+apiVersion: blueprints.stackship.se/v2
+kind: BlueprintTemplate
+
+# n8n from the project's own image, docker.io/n8nio/n8n. Facts read off the
+# image and off running it, in the order they shape the file:
+#
+#   - ENTRYPOINT is ["tini", "--", "/docker-entrypoint.sh"] and there is NO CMD.
+#     That script execs `n8n` with no arguments when it is given none, so the
+#     command below is the whole of what runs.
+#   - USER is `node`, uid and gid 1000. WORKDIR is /home/node, port 5678.
+#   - It WRITES to /home/node/.n8n — the settings file holding the encryption
+#     key (0600), an event log, a crash journal, installed community nodes, and
+#     execution/binary storage. That directory is the instance's state and is on
+#     a persistent volume below.
+#   - It also writes to /home/node/.cache, which DOES NOT EXIST in the image.
+#     With a read-only root filesystem and nothing mounted there, n8n starts,
+#     opens its port, and then dies on "Error: ENOENT: no such file or
+#     directory, mkdir '/home/node/.cache'" — after logging that the editor is
+#     ready, which makes it read like a healthy instance for a few seconds.
+#
+# The component IS marked `hardened`, which the last point makes possible rather
+# than prevents: an emptyDir mounted at /home/node/.cache creates the path, the
+# platform mounts a memory-backed /tmp alongside it, and the state directory is
+# the persistent volume. Measured on 2.36.7 — with those three mounts a
+# read-only root filesystem runs migrations, serves the editor and completes
+# owner setup normally.
+#
+# ── The database, and the one setting that decides whether this works at all ──
+#
+# A Stackship-managed PostgreSQL, declared as a resource, as Keycloak and
+# Stalwart declare one — five separate outputs rather than a connection string,
+# because n8n takes DB_POSTGRESDB_HOST/_PORT/_DATABASE/_USER/_PASSWORD as five
+# settings and has no whole-URI form.
+#
+# DB_POSTGRESDB_SSL_ENABLED IS NOT OPTIONAL HERE. The platform's PostgreSQL
+# enforces TLS in pg_hba — `hostnossl all all 0.0.0.0/0 reject` — and n8n's
+# client defaults to no TLS at all. Left alone, n8n never connects and never
+# fails either: it retries with backoff forever, logging
+#
+#   Initial database connection attempt 1 failed: pg_hba.conf rejects
+#   connection for host "10.x.x.x", user "app", database "app", no encryption.
+#
+# which reads as a network problem rather than a missing flag. Turning TLS on
+# then hits the second half of the same trap: n8n verifies the chain by default
+# and CloudNativePG signs its server certificate with its own internal CA that
+# is nowhere in this image's trust store, so it fails on "self-signed
+# certificate". Both were reproduced against a PostgreSQL configured with the
+# platform's own pg_hba rules before this file was written, which is why
+# _SSL_REJECT_UNAUTHORIZED is set alongside _SSL_ENABLED and neither is a
+# parameter: the pair is what the platform's database requires, and one without
+# the other is a broken deploy in two different ways.
+#
+# The connection is encrypted either way. What is given up is proof of WHICH
+# server answered, on a ClusterIP address inside the boundary that only the
+# platform can route to. Mounting CloudNativePG's CA and setting
+# DB_POSTGRESDB_SSL_CA would close that gap for anyone who wants it.
+#
+# ── One instance, and what that rules out ────────────────────────────────────
+#
+# EXECUTIONS_MODE stays `regular`: the editor and the executions share one
+# process. n8n's other shape — queue mode, with a separate worker fleet and a
+# Redis holding the queue — is a different blueprint, not a parameter, and it is
+# the thing to move to when a long execution starts blocking the editor.
+#
+# So `replicas` is 1 and, unlike most components in this catalog, is not a
+# default to raise. Two replicas of a regular-mode n8n both run every schedule
+# trigger and both claim the same webhooks, so every cron fires twice; they
+# would also both want the same ReadWriteOnce volume. The `Recreate` strategy
+# the platform gives any component with a persistent volume means an upgrade is
+# stop-then-start — a brief outage, and the right one, since two versions must
+# never share a database mid-migration.
+
+metadata:
+  slug: n8n
+  title: n8n
+  description: >-
+    Workflow automation you build by wiring nodes together: several hundred
+    integrations, HTTP and webhooks for everything else, and JavaScript in the
+    gaps where a node does not exist. Self-hosted, so the credentials and the
+    data stay in your own cluster — with a Stackship-managed PostgreSQL behind
+    it.
+  version: "2.36.7"
+  category: Platforms
+  tags: [n8n, automation, workflow, integration, webhooks, low-code, ai]
+  documentation: https://docs.n8n.io/hosting/
+
+parameters:
+  - name: version
+    type: Select
+    label: n8n Version
+    description: >-
+      Tag on docker.io/n8nio/n8n. n8n ships several releases a week, so pin an
+      exact version for anything you depend on. "stable" is the floating tag
+      upstream moves to each stable release — convenient, and note that it will
+      carry you across a MAJOR version without asking, which for n8n means
+      breaking changes in both workflows and configuration.
+    options: ["2.36.7", "2.35.7", "stable"]
+    default: "2.36.7"
+    documentation: https://github.com/n8n-io/n8n/releases
+
+  - name: compute_plan
+    type: Select
+    label: Compute Plan
+    description: >-
+      Memory decides this. n8n is Node.js and holds an execution's data in
+      memory while it runs, so the size of the payloads moving through your
+      workflows matters more than how many there are: medium (500m/1Gi) is fine
+      for API calls and modest records, large (2000m/4Gi) is what to pick for
+      anything handling files or large result sets. `small` is not offered — n8n
+      does not fit in 256Mi.
+    options: ["medium", "large"]
+    default: "medium"
+
+  - name: encryption_key
+    type: Secret
+    label: Encryption Key
+    description: >-
+      Encrypts every credential n8n stores. THIS VALUE MUST NEVER CHANGE:
+      credentials are encrypted with it and there is no recovery path — replace
+      it and every stored credential becomes undecryptable and has to be entered
+      again, in every workflow that uses one. It is generated once here and
+      written to the instance vault; take a copy of it somewhere your disaster
+      recovery can reach, because a restored database is useless without it.
+      Generated as base64 rather than as a random string because the default
+      generator's alphabet contains !@#$%^&*, and this is a value people copy
+      into shells and .env files.
+    generate: true
+    generateSpec: base64
+    generateLength: 32
+
+  - name: timezone
+    type: String
+    label: Timezone
+    description: >-
+      IANA timezone that Schedule and Cron triggers are interpreted in, e.g.
+      Europe/Stockholm or America/New_York. Set explicitly because n8n's own
+      default is America/New_York, which is a surprise to almost everyone
+      running it and one that only shows up as workflows firing at the wrong
+      hour. UTC is the safe answer if the schedules are machine-facing; a real
+      zone is the right one if a human picked the times.
+    default: "UTC"
+
+  - name: community_nodes
+    type: Boolean
+    label: Allow Community Nodes
+    description: >-
+      Whether the editor can install community node packages from npm. Off here,
+      where upstream defaults it on, and the reason is what those packages get:
+      a community node is arbitrary JavaScript running inside the process that
+      holds every credential this instance stores, installed by anyone with
+      editor access. Turn it on deliberately, for a team you would let deploy
+      code. Unverified packages stay off regardless.
+    default: "false"
+
+  - name: telemetry
+    type: Boolean
+    label: Send Usage Telemetry
+    description: >-
+      Whether n8n reports usage to its own analytics endpoint. Off here, on by
+      default upstream. Nothing about it is hostile — it is product analytics —
+      but a self-hosted automation server in a private cluster is a place where
+      "off unless asked for" is the better default.
+    default: "false"
+
+  - name: executions_max_age_hours
+    type: String
+    label: Keep Execution History For (hours)
+    description: >-
+      How long finished executions are kept before pruning, in hours: 336 is
+      fourteen days, 720 is thirty, 24 is a day. Execution history is what makes
+      a failure debuggable and is also, by a wide margin, the biggest thing in
+      an n8n database — a busy instance writes a row plus its data for every run
+      of every workflow. Pruning is on and keeps at most 10,000 executions
+      regardless of age.
+    default: "336"
+
+  - name: storage_size
+    type: Select
+    label: Instance Storage
+    description: >-
+      Volume for /home/node/.n8n — the settings file, installed community nodes,
+      and the binary data of executions, which is what actually grows. Binary
+      data lands on this volume rather than in the database (n8n's own default
+      for a single instance), so size it against the files your workflows move,
+      not against the number of workflows.
+    options: ["1Gi", "5Gi", "10Gi", "20Gi", "50Gi"]
+    default: "5Gi"
+
+  - name: db_availability
+    type: Select
+    label: Database
+    description: >-
+      A Stackship-managed PostgreSQL, with backups and the platform's own
+      upgrade path. High availability runs three instances so the loss of a
+      node promotes a replica instead of taking the database down.
+    options: ["Single Instance", "High Available"]
+    default: "Single Instance"
+
+  - name: db_storage_size
+    type: Select
+    label: Database Storage
+    description: >-
+      Volume for the managed PostgreSQL. Workflows and credentials are tiny;
+      what grows is the execution history governed by the retention above.
+    options: ["5Gi", "10Gi", "20Gi", "50Gi"]
+    default: "10Gi"
+
+  - name: db_pool_size
+    type: String
+    label: Database Pool Size
+    description: >-
+      Connections n8n holds open. Upstream's default is 2, which is enough for
+      an instance running a handful of workflows and is the first thing to raise
+      if executions start queueing on database waits rather than on their own
+      work.
+    default: "2"
+    advanced: true
+
+  - name: ingress_host
+    type: String
+    label: Public Hostname
+    description: >-
+      Public hostname for the editor AND for every webhook this instance
+      publishes. n8n bakes it into the webhook URLs it hands out, which you then
+      paste into third-party services — so moving it later means revisiting
+      every one of them. Choose the name you intend to keep.
+    default: "[%name%].{{domain_suffix}}"
+
+  - name: ingress_certificate_issuer
+    type: String
+    label: Certificate Issuer
+    description: cert-manager ClusterIssuer name
+    default: "{{cert_issuer}}"
+    advanced: true
+
+outputs:
+  - name: editor_url
+    label: Editor
+    description: >-
+      The n8n editor. The first person to open it creates the owner account —
+      do that promptly, because until it exists anyone who reaches the hostname
+      can claim it.
+    type: Url
+    value: "https://[%ingress_host%]/"
+  - name: webhook_base_url
+    label: Webhook Base URL
+    description: >-
+      What production webhook URLs are built from; a workflow's own path is
+      appended to it. Deliberately not behind the platform's sign-in — a service
+      calling a webhook cannot complete an interactive login — so treat the
+      unguessable path in each URL as the credential it is.
+    type: Url
+    value: "https://[%ingress_host%]/webhook"
+
+# The database, provisioned by the platform rather than run as a container here.
+# `name: db` makes the cluster {instance}-db, scoped to this instance so two
+# deployments of this blueprint into one resource group cannot silently share
+# one database.
+resources:
+  - name: db
+    type: postgres
+    availability: "[%db_availability%]"
+    storage: "[%db_storage_size%]"
+    exposes:
+      # Five outputs, because n8n takes five settings. db_host and db_port are
+      # not secret and still travel through the vault: the resource publishes
+      # all five the same way, and reading two of them differently would mean
+      # the template knew the database's address before it existed.
+      - output: host
+        vaultKey: db_host
+      - output: port
+        vaultKey: db_port
+      - output: database
+        vaultKey: db_name
+      - output: username
+        vaultKey: db_user
+      - output: password
+        vaultKey: db_password
+
+instance:
+  components:
+    - name: n8n
+      # The only component. Database readiness is not this file's problem: the
+      # platform provisions the declared resource and polls it until it accepts
+      # connections BEFORE the instance is created, so n8n has never yet been
+      # started against a cluster still running initdb.
+      startupOrder: 1
+      # See the header — not a default to raise. Two regular-mode replicas fire
+      # every schedule trigger twice.
+      replicas: 1
+      # Measured, not assumed: read-only root filesystem, with the two mounts
+      # below and the platform's own tmpfs /tmp.
+      hardened: true
+      # The image's own uid. Its gid is 1000 too, and the volume's fsGroup below
+      # matches so the state directory is writable.
+      runAsUser: 1000
+      computePlan: "[%compute_plan%]"
+      containers:
+        - name: n8n
+          image: docker.io/n8nio/n8n
+          tag: "[%version%]"
+          # The image's ENTRYPOINT, with tini spelled absolutely rather than as
+          # the bare `tini` the image uses — this argv is handed to the
+          # secret-exec shim, and an absolute path needs no PATH lookup from it.
+          # No args: /docker-entrypoint.sh runs `n8n` with none when it is given
+          # none.
+          #
+          # Declaring it at all is load-bearing. A container carrying a
+          # vault-backed env var runs through that shim, and Kubernetes cannot
+          # PREPEND to an entrypoint — setting `command` replaces it. Omit this
+          # and the database password and the encryption key are resolved and
+          # then silently dropped, and n8n comes up generating a NEW encryption
+          # key, which is the one failure here with no undo.
+          command: [/sbin/tini, --, /docker-entrypoint.sh]
+          ports:
+            - name: http
+              port: 5678
+          env:
+            - name: DB_TYPE
+              value: postgresdb
+            - name: DB_POSTGRESDB_HOST
+              secretRef: { vault: "[%instance_vault%]", key: db_host }
+            - name: DB_POSTGRESDB_PORT
+              secretRef: { vault: "[%instance_vault%]", key: db_port }
+            - name: DB_POSTGRESDB_DATABASE
+              secretRef: { vault: "[%instance_vault%]", key: db_name }
+            - name: DB_POSTGRESDB_USER
+              secretRef: { vault: "[%instance_vault%]", key: db_user }
+            - name: DB_POSTGRESDB_PASSWORD
+              secretRef: { vault: "[%instance_vault%]", key: db_password }
+            # The pair the platform's database requires; see the header. Neither
+            # is a parameter, because either one alone is a deploy that does not
+            # connect.
+            - name: DB_POSTGRESDB_SSL_ENABLED
+              value: "true"
+            - name: DB_POSTGRESDB_SSL_REJECT_UNAUTHORIZED
+              value: "false"
+            - name: DB_POSTGRESDB_POOL_SIZE
+              value: "[%db_pool_size%]"
+
+            - name: N8N_ENCRYPTION_KEY
+              secretRef: { vault: "[%instance_vault%]", key: encryption_key }
+
+            # Where n8n thinks it lives. It cannot infer this behind a
+            # TLS-terminating ingress — it sees plain HTTP on a pod IP — and
+            # every webhook URL it hands out, every OAuth callback it registers
+            # and the link in every invitation email is built from these.
+            - name: N8N_HOST
+              value: "[%ingress_host%]"
+            - name: N8N_PROTOCOL
+              value: "https"
+            - name: N8N_PORT
+              value: "5678"
+            - name: WEBHOOK_URL
+              value: "https://[%ingress_host%]/"
+            - name: N8N_EDITOR_BASE_URL
+              value: "https://[%ingress_host%]/"
+            # One proxy in front: the ingress controller. Without this n8n reads
+            # the controller's address as the client's, which matters wherever a
+            # workflow branches on the caller's IP.
+            - name: N8N_PROXY_HOPS
+              value: "1"
+
+            - name: GENERIC_TIMEZONE
+              value: "[%timezone%]"
+            # The process timezone as well, so log lines and anything a Code
+            # node reads from the system clock agree with the triggers.
+            - name: TZ
+              value: "[%timezone%]"
+
+            - name: N8N_COMMUNITY_PACKAGES_ENABLED
+              value: "[%community_nodes%]"
+            # Unverified packages stay off whatever the answer above. This is
+            # also one of four settings n8n names in a startup deprecation
+            # notice as having a default that will change; setting it here means
+            # an upgrade cannot move it underneath you.
+            - name: N8N_UNVERIFIED_PACKAGES_ENABLED
+              value: "false"
+
+            - name: N8N_DIAGNOSTICS_ENABLED
+              value: "[%telemetry%]"
+
+            # Execution history, and the pruning that keeps it from being the
+            # whole database. PRUNE is n8n's default and is pinned so it cannot
+            # be lost in a config change; MAX_AGE is the parameter.
+            - name: EXECUTIONS_DATA_PRUNE
+              value: "true"
+            - name: EXECUTIONS_DATA_MAX_AGE
+              value: "[%executions_max_age_hours%]"
+
+            # Binary data on the volume rather than in the database. Already
+            # n8n's default for a single instance; pinned because the default is
+            # conditional on the execution mode, and the difference between the
+            # two is whether a 50MB attachment becomes a 50MB database row.
+            - name: N8N_DEFAULT_BINARY_DATA_MODE
+              value: "filesystem"
+
+            # The remaining three deprecation notices, each pinned at today's
+            # value rather than tomorrow's. n8n asks for exactly this: it warns
+            # that these defaults are scheduled to drop — task timeout 300s to
+            # 60s, decompression 2GiB to 256MiB, zip entries 5000 to 1000 — and
+            # recommends setting them explicitly to keep current behaviour. A
+            # workflow that quietly starts timing out after an upgrade is a bad
+            # afternoon; lower them here deliberately once you know nothing
+            # needs the headroom.
+            - name: N8N_RUNNERS_TASK_TIMEOUT
+              value: "300"
+            - name: N8N_COMPRESSION_NODE_MAX_DECOMPRESSED_SIZE_BYTES
+              value: "2147483648"
+            - name: N8N_COMPRESSION_NODE_MAX_ZIP_ENTRIES
+              value: "5000"
+
+            # Silences a confusing error on every start. n8n 2.x launches task
+            # runners in-process and tries a Python one, which this image has no
+            # Python for — "Failed to start Python task runner in internal mode.
+            # because Python 3 is missing from this system", logged at error
+            # level while everything is in fact fine. The JavaScript runner,
+            # which is the one Code nodes use, is unaffected.
+            - name: N8N_PYTHON_ENABLED
+              value: "false"
+
+            # Not set here, and each for a reason worth knowing:
+            #
+            #   EXECUTIONS_MODE — left at `regular`. Queue mode needs a worker
+            #     fleet and a Redis, which is a different blueprint.
+            #   N8N_METRICS — Prometheus metrics at /metrics, off by default and
+            #     on the same port the editor and webhooks are published on, so
+            #     turning it on publishes it too.
+            #   N8N_LICENSE_ACTIVATION_KEY — the enterprise licence. An empty
+            #     value is not the same as an absent one for most such settings,
+            #     so it belongs in the component sheet of whoever has a key.
+            #   N8N_SECURE_COOKIE — left on. It is what stops the session cookie
+            #     travelling over plain HTTP, and the endpoint below is HTTPS.
+          probes:
+            # /healthz answers as soon as the server is up; /healthz/readiness
+            # additionally reports the database. Readiness is the one that
+            # should take the pod out of the load balancer when the database
+            # goes away, and liveness the one that must NOT — a database outage
+            # should drain this pod, not restart it in a loop.
+            readiness:
+              type: http
+              port: http
+              path: /healthz/readiness
+              periodSeconds: 10
+              timeoutSeconds: 5
+              failureThreshold: 3
+            liveness:
+              type: http
+              port: http
+              path: /healthz
+              periodSeconds: 20
+              timeoutSeconds: 5
+              failureThreshold: 3
+            # Ten minutes, and the reason is the first start: n8n runs its whole
+            # migration history against an empty database before it serves, which
+            # is a few hundred migrations and took about forty seconds warm.
+            # A major upgrade runs more of them against a database with real
+            # data in it. A budget that is merely typical turns a long, correct
+            # migration into a crash loop — and a migration interrupted halfway
+            # is the expensive kind of failure.
+            startup:
+              type: http
+              port: http
+              path: /healthz
+              initialDelaySeconds: 10
+              periodSeconds: 5
+              failureThreshold: 120
+          mounts:
+            - volume: state
+              path: /home/node/.n8n
+            - volume: cache
+              path: /home/node/.cache
+
+      volumes:
+        - name: state
+          persistent:
+            size: "[%storage_size%]"
+            tier: standard
+            # uid and gid are both 1000 in this image. A fresh volume arrives
+            # empty and root-owned, and without this n8n cannot write the
+            # settings file that holds its encryption key.
+            fsGroup: 1000
+        - name: cache
+          # Not persistent, and not optional. /home/node/.cache does not exist
+          # in the image; with a read-only root filesystem n8n dies trying to
+          # create it, AFTER announcing that the editor is ready. Nothing here
+          # needs to survive a restart — it is a cache — so an emptyDir is the
+          # whole fix.
+          emptyDir:
+            sizeLimit: "256Mi"
+
+  endpoints:
+    # One hostname, everything on it: the editor, the REST API it talks to, the
+    # webhooks, and /healthz.
+    #
+    # No authGuard, deliberately. n8n has real user management of its own — an
+    # owner account created on first visit, invited users with roles, SSO on the
+    # paid tiers — and putting the platform's interactive sign-in in front of
+    # the whole host would break every webhook on it, since a service calling
+    # one cannot complete a login. What protects a webhook is the unguessable
+    # path in its URL plus whatever authentication the workflow's own trigger
+    # node is configured with, which is where it belongs.
+    - name: web
+      component: n8n
+      port: http
+      expose: ingress
+      hostname: "[%ingress_host%]"
+      issuer: "[%ingress_certificate_issuer%]"
