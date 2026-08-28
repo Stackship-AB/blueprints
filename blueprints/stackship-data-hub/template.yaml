@@ -51,9 +51,9 @@ parameters:
     default: "10Gi"
 
   # Both keys below are base64-decoded by the application before use, so they are generated
-  # as base64 rather than as a random string. Without generateSpec the generator falls back to
-  # an alphabet containing !@#$%^&* — not valid base64 — and the API fails at startup with
-  # "The input is not a valid Base-64 string". generateLength counts BYTES on this path.
+  # as base64 rather than as a random string. Without generateSpec the generator produces a
+  # character string whose decoded byte count won't match what the application validates.
+  # generateLength counts BYTES on this path.
   - name: jwt_signing_key
     type: Secret
     label: JWT Signing Key
