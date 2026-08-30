@@ -25,7 +25,7 @@ metadata:
     Self-hosted Supabase — open source Firebase alternative with PostgreSQL
     database, authentication, instant APIs, realtime subscriptions, storage, and
     Studio dashboard.
-  version: "3.0"
+  version: "3.1"
   category: Databases
   tags: [supabase, database, auth, storage, realtime, api, postgres]
   documentation: https://supabase.com/docs/guides/self-hosting
@@ -609,17 +609,26 @@ instance:
         - name: kong
           image: registry.stackship.se/blueprints/supabase/kong
           tag: "3.9.1"
-          # The image's own ENTRYPOINT and CMD, declared so the operator can wrap
-          # them: a container with a vault-backed variable runs through the
-          # secret-exec shim, and Kubernetes has no way to PREPEND to an
-          # entrypoint — setting command replaces it. Without this the secret is
-          # resolved and then dropped, which is how postgres reported its password
-          # unset moments after secret-init reported resolving it.
+          # Kong resolves {vault://...} references only in referenceable fields
+          # (kong.conf, certain plugin fields, certificate fields) — NOT in a
+          # consumer's key-auth credential key, which is a plain string field.
+          # A {vault://env/...} there is stored verbatim, so the real anon /
+          # service_role JWTs a client sends match nothing and key-auth returns
+          # 401. The keys must therefore be substituted into the declarative
+          # config from the vault-backed env before Kong reads it. sed (not a
+          # bash `eval`) because kong.tmpl is full of double quotes; the JWTs are
+          # base64url so `#` is a safe delimiter. The declarative config is
+          # written to kong.yml (kong's writable home) from the read-only
+          # kong.tmpl mount; the whole command is still wrapped by the
+          # secret-exec shim so ANON_KEY / SERVICE_ROLE_KEY are in the env here.
           command:
-            - /entrypoint.sh
-          args:
-            - kong
-            - docker-start
+            - /bin/sh
+            - -c
+            - |
+              set -e
+              sed "s#__ANON_KEY__#${ANON_KEY}#g; s#__SERVICE_ROLE_KEY__#${SERVICE_ROLE_KEY}#g" \
+                /home/kong/kong.tmpl > /home/kong/kong.yml
+              exec /entrypoint.sh kong docker-start
           ports:
             - name: http
               port: 8000
@@ -660,8 +669,10 @@ instance:
               periodSeconds: 20
               failureThreshold: 3
           mounts:
+            # Mounted as kong.tmpl (read-only); the command seds the JWT keys in
+            # and writes the resolved kong.yml that KONG_DECLARATIVE_CONFIG names.
             - volume: config
-              path: /home/kong/kong.yml
+              path: /home/kong/kong.tmpl
               subPath: kong.yml
               readOnly: true
       volumes:
@@ -678,15 +689,15 @@ instance:
                   - username: DASHBOARD
                   - username: anon
                     keyauth_credentials:
-                      # Kong 3.x resolves {vault://env/...} references against env vars at
-                      # startup. The ANON_KEY / SERVICE_ROLE_KEY env vars below are sourced
-                      # from the supabase-secrets Secret via secretKeyRef so the JWT keys
-                      # never appear as plaintext in the ConfigMap or in the rendered
-                      # manifest stored on the BlueprintInstance CR.
-                      - key: "{vault://env/anon-key}"
+                      # Placeholders the container's start command replaces with
+                      # the real JWTs from the vault-backed ANON_KEY /
+                      # SERVICE_ROLE_KEY env vars. They stay placeholders in the
+                      # ConfigMap and on the CR, so the JWT keys are never stored
+                      # as plaintext there.
+                      - key: "__ANON_KEY__"
                   - username: service_role
                     keyauth_credentials:
-                      - key: "{vault://env/service-role-key}"
+                      - key: "__SERVICE_ROLE_KEY__"
 
                 acls:
                   - consumer: anon
