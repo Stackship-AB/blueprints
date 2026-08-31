@@ -1,0 +1,682 @@
+apiVersion: blueprints.stackship.se/v2
+kind: BlueprintTemplate
+
+# Gitea from the project's own image — and specifically from the ROOTLESS one,
+# docker.io/gitea/gitea:<version>-rootless. That choice comes first because
+# everything else follows from it:
+#
+#   - The standard image boots s6-overlay as root and runs a real OpenSSH
+#     daemon. The platform drops ALL capabilities from every container and this
+#     component pins a non-root uid, so that image has nowhere to stand here.
+#   - The rootless image runs as USER 1000:1000 and needs no sshd: Gitea's own
+#     built-in SSH server (START_SSH_SERVER) answers git-over-SSH inside the
+#     same process, on port 2222.
+#   - ENTRYPOINT is ["/usr/bin/dumb-init", "--", "/usr/local/bin/docker-entrypoint.sh"]
+#     and CMD is []. That script runs docker-setup.sh and then, given no
+#     arguments, execs `gitea -c "$GITEA_APP_INI" web`. So the command below is
+#     the whole of what runs.
+#   - Its environment sets GITEA_WORK_DIR=/var/lib/gitea, GITEA_APP_INI=
+#     /etc/gitea/app.ini and GITEA_TEMP=TMPDIR=/tmp/gitea, and it declares
+#     3000/tcp and 2222/tcp. Both directories are VOLUMEs in the image, and
+#     both are persistent volumes below.
+#
+# The component IS marked `hardened`. Measured on 1.27.3, against a PostgreSQL
+# carrying the platform's own pg_hba rules: with a read-only root filesystem,
+# the platform's memory-backed /tmp (which is where GITEA_TEMP lives) and the
+# two persistent volumes, Gitea migrated an empty database, served the web UI,
+# generated its SSH host keys, and completed an HTTP clone, an HTTP push and an
+# SSH push — with nothing in the log about a read-only filesystem.
+#
+# ── Configuration: use the GITEA__ form, never the plain names ────────────────
+#
+# The image has two config mechanisms and they are not interchangeable.
+# docker-setup.sh renders /etc/gitea/app.ini from a template with envsubst ONLY
+# WHEN THAT FILE DOES NOT EXIST — that is where the plain names (DB_HOST,
+# SECRET_KEY, APP_NAME, INSTALL_LOCK…) are read. It then runs
+# `environment-to-ini`, which applies every GITEA__SECTION__KEY variable to the
+# file on EVERY start. Because app.ini is on a persistent volume here, the plain
+# names would apply exactly once, on the very first boot, and silently stop
+# mattering thereafter — a parameter you changed would appear to be ignored. So
+# every setting below is a GITEA__ variable.
+#
+# The root section of the ini (APP_NAME, RUN_MODE) has an empty section name,
+# which is spelled with FOUR underscores: `GITEA____APP_NAME`. `GITEA__DEFAULT__
+# APP_NAME` looks right and does nothing except add a stray `[default]` section;
+# both were tried before this file was written.
+#
+# ── Why the config directory is a persistent volume, not an emptyDir ──────────
+#
+# Gitea generates key material into app.ini on first start and keeps it there.
+# Read off the generated file: `[security] INTERNAL_TOKEN`, `[server]
+# LFS_JWT_SECRET` and `[oauth2] JWT_SECRET` are all written back by Gitea
+# itself. On an emptyDir all three are regenerated on every restart, which
+# invalidates every OAuth2 access token this instance has issued and every LFS
+# upload session in flight — with no error anywhere, because from Gitea's side
+# nothing failed.
+#
+# SECRET_KEY is the opposite case and the reason it is a parameter: the image's
+# own template leaves it EMPTY unless it is given one (`SECRET_KEY = ` is what
+# lands in the file), and it is what encrypts 2FA secrets and mirror
+# credentials in the database. It is generated once here, written to the
+# instance vault, and applied on every start.
+#
+# ── The database, and the two settings that decide whether this works ─────────
+#
+# A Stackship-managed PostgreSQL, declared as a resource, as Keycloak and n8n
+# declare one. Four outputs, not five, and that is deliberate:
+#
+#   `[database] HOST` is Gitea's ONLY address setting — there is no PORT key,
+#   the value is a `host:port` pair, and a template has no string operations to
+#   build one. It does not need to: Gitea's parsePgSQLHostPort falls back to
+#   5432 when the value carries no port, which is exactly what the managed
+#   cluster listens on. So the `host` output goes in alone. If the platform ever
+#   moves PostgreSQL off 5432, this line is what breaks, and it breaks loudly at
+#   connect time rather than quietly.
+#
+#   SSL_MODE IS NOT OPTIONAL. The platform's PostgreSQL enforces TLS in pg_hba
+#   — `hostnossl all all 0.0.0.0/0 reject` — and Gitea's default is `disable`.
+#   Left alone the deploy fails on "pg_hba.conf rejects connection ... no
+#   encryption", which reads as a firewall problem rather than a missing
+#   setting. `require` was chosen over `verify-full` for the same reason n8n
+#   turns off certificate verification: CloudNativePG signs its server
+#   certificate with its own internal CA, which is nowhere in this image's trust
+#   store, so verification fails on a self-signed chain. The connection is
+#   encrypted either way; what is given up is proof of WHICH server answered, on
+#   a ClusterIP address inside the boundary that only the platform can route to.
+#
+# ── The bootstrap administrator, and why it needs an init container ───────────
+#
+# Gitea's install wizard is locked here (INSTALL_LOCK=true), which is what keeps
+# a freshly deployed forge from being configured by whoever reaches it first.
+# That leaves the CLI as the only way to create the first account — and
+# `gitea admin user create` calls db.InitEngine, which opens the database but
+# does NOT migrate it, so against a brand-new cluster it fails on tables that do
+# not exist yet. Gitea's answer is the `migrate` command, whose own help says
+# it exists "so that you can run gitea admin create user before starting the
+# server". The init container is that sequence, and nothing more.
+#
+# It runs on every start, which is the point: `migrate` is idempotent, and the
+# create is guarded by its exit code — a success or one of the two
+# already-exists messages continues, and ANY other failure stops the pod rather
+# than leaving a forge standing with no administrator. Both paths were run
+# against a real instance before this file was written.
+#
+# Because the administrator exists before the web server accepts its first
+# request, `disable_registration` can default to true. That is the whole payoff:
+# an unclaimed self-hosted forge with open registration is the failure mode this
+# blueprint is built to not have.
+#
+# ── One replica, and why it is not a number to raise ──────────────────────────
+#
+# `replicas: 1`, and the platform enforces it anyway — a component with a
+# persistent volume is capped at one, because the volume is ReadWriteOnce. It is
+# also the correct number. This Gitea keeps its issue index (bleve), its queues
+# and its session store on that volume, runs its cron jobs in-process, and
+# serves SSH from the same process; a second replica would duplicate every cron
+# run and index into a disk it cannot see. Scaling Gitea out is a different
+# deployment shape — external indexer, external queue, RWX storage — not a
+# parameter. The `Recreate` strategy the platform gives any component with a
+# persistent volume makes an upgrade stop-then-start, which is also the only
+# safe order when the new version migrates the database.
+
+metadata:
+  slug: gitea
+  title: Gitea
+  description: >-
+    A self-hosted Git forge: repositories, pull requests and code review,
+    issues, a package registry, and Actions-compatible CI — over HTTPS and over
+    SSH. Light enough to run beside your other services, with a
+    Stackship-managed PostgreSQL behind it and a bootstrap administrator whose
+    password lands in the instance vault.
+  version: "1.27.3"
+  category: Platforms
+  tags: [gitea, git, forge, scm, version-control, code-review, ci, self-hosted]
+  documentation: https://docs.gitea.com/
+
+parameters:
+  - name: version
+    type: Select
+    label: Gitea Version
+    description: >-
+      Tag on docker.io/gitea/gitea, always the `-rootless` variant — the plain
+      tags run s6-overlay and OpenSSH as root and cannot start here. A minor tag
+      such as "1.27" follows its patch releases, which is how a security fix
+      reaches you without an edit; pin the exact patch for an installation that
+      must not move on its own. Gitea's upgrades are one-way: the first start on
+      a new version migrates the database and the old binary will not open it
+      again.
+    options: ["1.27.3", "1.27", "1.26"]
+    default: "1.27.3"
+    documentation: https://github.com/go-gitea/gitea/releases
+
+  - name: compute_plan
+    type: Select
+    label: Compute Plan
+    description: >-
+      Gitea itself is small — measured at about 100Mi resident while idle and
+      after ordinary pushes. What sets the ceiling is the `git` processes it
+      forks: a clone or a repack of a large repository can take hundreds of
+      megabytes, and it is the whole container that the kernel kills, not the
+      git child. `small` (250m/256Mi) is a personal instance with small
+      repositories; `medium` is the right default for a team; `large` is for
+      repositories with big histories or binary assets.
+    options: ["small", "medium", "large"]
+    default: "medium"
+
+  - name: app_name
+    type: String
+    label: Instance Name
+    description: >-
+      Shown in the page title and on the sign-in screen. Cosmetic, and the one
+      setting people notice immediately.
+    default: "Gitea"
+
+  - name: admin_username
+    type: String
+    label: Administrator Username
+    description: >-
+      The bootstrap administrator, created by the init container before the web
+      server serves its first request. Created once — renaming this later does
+      not rename the account, it tries to create a second one and finds the
+      first administrator's email already in use.
+    default: "admin"
+
+  - name: admin_email
+    type: String
+    label: Administrator Email
+    description: >-
+      Address for the bootstrap administrator. It only has to be a valid
+      address, not a reachable one — nothing is sent to it unless you configure
+      a mailer — but make it one you own if you ever want a password reset. The
+      default is spelled out from [%name%] rather than from the hostname below:
+      substitution is a single pass, so a default that referenced another
+      parameter's default would resolve to that default's own unexpanded tokens.
+    default: "admin@[%name%].{{domain_suffix}}"
+
+  - name: admin_password
+    type: Secret
+    label: Administrator Password
+    description: >-
+      Password for the bootstrap administrator. Auto-generated and readable from
+      the instance vault. It is applied only when the account is created; change
+      it in Gitea afterwards and the vault copy simply goes stale, which is the
+      right way round — a restart must never quietly reset a password someone
+      chose.
+    generate: true
+    generateLength: 24
+
+  - name: secret_key
+    type: Secret
+    label: Secret Key
+    description: >-
+      Gitea's SECRET_KEY, which encrypts the credentials it stores in the
+      database — 2FA secrets, push-mirror passwords, external authentication
+      secrets. THIS VALUE MUST NEVER CHANGE: nothing encrypted with the old key
+      can be read with a new one, and there is no recovery path. Take a copy of
+      it somewhere your disaster recovery can reach, because a restored database
+      is only half of a restored Gitea. The image leaves this EMPTY if it is not
+      given one, which is why it is generated here rather than left alone.
+    generate: true
+    generateLength: 64
+
+  - name: disable_registration
+    type: Boolean
+    label: Disable Self-Registration
+    description: >-
+      Whether visitors can create their own accounts. ON here, where upstream
+      leaves registration open, and the init container is what makes that
+      possible: the administrator already exists, so closing the door costs
+      nothing. Turn it off for a forge that is meant to be public, and reach for
+      the administrator's "New User" page for everything else.
+    default: "true"
+
+  - name: require_signin
+    type: Boolean
+    label: Require Sign-In To View
+    description: >-
+      Whether anonymous visitors see anything at all. Off by default, matching
+      Gitea, so public repositories are readable without an account. Turn it on
+      for an internal forge and the whole instance — including repositories
+      marked public — disappears behind the sign-in page.
+    default: "false"
+
+  - name: ssh_enabled
+    type: Boolean
+    label: Publish Git over SSH
+    description: >-
+      Whether to give this instance a load-balancer address for git-over-SSH.
+      Gitea's built-in SSH server runs either way; this decides whether it is
+      reachable from outside the cluster. Turning it OFF leaves the SSH clone
+      URLs on show in the UI while nothing answers them — an endpoint's
+      condition takes a parameter name, not its negation, so this template
+      cannot flip DISABLE_SSH for you. If you turn this off, set
+      GITEA__server__DISABLE_SSH=true on the component afterwards.
+    default: "true"
+
+  - name: ssh_host
+    type: String
+    label: SSH Hostname
+    description: >-
+      The hostname Gitea puts in the SSH clone URLs it hands out. This is NOT
+      the web hostname: a load-balancer endpoint gets its own IP address, so you
+      point this name at that address with a DNS A record once the instance is
+      up. Until that record exists, SSH clone URLs will not resolve — HTTPS
+      cloning works from the first minute regardless.
+    default: "[%name%]-ssh.{{domain_suffix}}"
+
+  - name: storage_size
+    type: Select
+    label: Repository Storage
+    description: >-
+      Volume for /var/lib/gitea — the repositories themselves, LFS objects,
+      attachments, avatars, the issue index and the SSH host keys. This is the
+      one that grows, and it grows with what people push. Size it against the
+      history you expect to import, not against the number of repositories.
+    options: ["10Gi", "20Gi", "50Gi", "100Gi", "250Gi"]
+    default: "20Gi"
+
+  - name: db_availability
+    type: Select
+    label: Database
+    description: >-
+      A Stackship-managed PostgreSQL, with backups and the platform's own
+      upgrade path. High availability runs three instances so the loss of a
+      node promotes a replica instead of taking the forge down.
+    options: ["Single Instance", "High Available"]
+    default: "Single Instance"
+
+  - name: db_storage_size
+    type: Select
+    label: Database Storage
+    description: >-
+      Volume for the managed PostgreSQL. Repositories are NOT in here — they are
+      files on the repository volume above. What this holds is metadata: users,
+      issues, pull requests, reviews, actions runs. It grows with activity
+      rather than with code.
+    options: ["5Gi", "10Gi", "20Gi", "50Gi"]
+    default: "10Gi"
+
+  - name: ingress_host
+    type: String
+    label: Public Hostname
+    description: >-
+      Public hostname for the web UI, the API, and git-over-HTTPS. Gitea bakes
+      it into ROOT_URL, which is what every clone URL, webhook payload and
+      notification link is built from — so moving it later means every checkout
+      that used the old name has to change its remote. Choose the name you
+      intend to keep.
+    default: "[%name%].{{domain_suffix}}"
+
+  - name: ingress_certificate_issuer
+    type: String
+    label: Certificate Issuer
+    description: cert-manager ClusterIssuer name
+    default: "{{cert_issuer}}"
+    advanced: true
+
+outputs:
+  - name: web_url
+    label: Web
+    description: >-
+      The forge. Sign in as the administrator below; the password is in the
+      instance vault.
+    type: Url
+    value: "https://[%ingress_host%]/"
+  - name: api_url
+    label: API
+    description: >-
+      Gitea's REST API, on the same hostname. Authenticate with a personal
+      access token created under Settings → Applications.
+    type: Url
+    value: "https://[%ingress_host%]/api/v1"
+  - name: admin_username
+    label: Administrator
+    description: The bootstrap administrator; its password is in the instance vault
+    type: String
+    value: "[%admin_username%]"
+  - name: ssh_remote
+    label: Git over SSH
+    description: >-
+      What SSH clone URLs look like once you point this name at the SSH
+      endpoint's load-balancer address. The port is 2222, not 22: the endpoint
+      publishes the container's own port, and Gitea advertises the same one.
+    type: String
+    value: "ssh://git@[%ssh_host%]:2222/"
+
+# The database, provisioned by the platform rather than run as a container here.
+# `name: db` makes the cluster {instance}-db, scoped to this instance so two
+# deployments of this blueprint into one resource group cannot silently share
+# one database.
+resources:
+  - name: db
+    type: postgres
+    availability: "[%db_availability%]"
+    storage: "[%db_storage_size%]"
+    exposes:
+      # Four, not five. See the header: Gitea has no PORT setting, and its HOST
+      # parser defaults to 5432 when the value carries no port. db_host is not
+      # secret and still travels through the vault, because the resource
+      # publishes all of its outputs the same way and reading one of them
+      # differently would mean the template knew the database's address before
+      # it existed.
+      - output: host
+        vaultKey: db_host
+      - output: database
+        vaultKey: db_name
+      - output: username
+        vaultKey: db_user
+      - output: password
+        vaultKey: db_password
+
+instance:
+  components:
+    - name: gitea
+      # The only component. Database readiness is not this file's problem: the
+      # platform provisions the declared resource and polls it until it accepts
+      # connections BEFORE the instance is created.
+      startupOrder: 1
+      # Not a default to raise — see the header. The platform rejects more than
+      # one anyway while a persistent volume is declared.
+      replicas: 1
+      # Measured, not assumed: read-only root filesystem, with the platform's
+      # own tmpfs /tmp (which is where GITEA_TEMP lives) and the two volumes.
+      hardened: true
+      # The image's own uid and gid. The volumes' fsGroup matches, so the
+      # repository and config directories are writable on a fresh disk.
+      runAsUser: 1000
+      runAsGroup: 1000
+      computePlan: "[%compute_plan%]"
+
+      initContainers:
+        # Migrate, then create the administrator. See the header for why this
+        # cannot be done by the main container or by an env var: the install
+        # wizard is locked, and `gitea admin user create` opens the database
+        # without migrating it.
+        - name: bootstrap
+          image: docker.io/gitea/gitea
+          tag: "[%version%]-rootless"
+          # A shell rather than the image's entrypoint, because this needs three
+          # steps and a conditional. docker-setup.sh is the first of them — it
+          # is what renders app.ini and applies the GITEA__ variables, and
+          # without it `migrate` has no configuration to read.
+          #
+          # Declaring a command at all is load-bearing: a container carrying a
+          # vault-backed env var runs through the secret-exec shim, and
+          # Kubernetes cannot PREPEND to an entrypoint — setting `command`
+          # replaces it. Omit it and the database password and the
+          # administrator's password are resolved and then silently dropped.
+          command: [/bin/sh, -ec]
+          args:
+            - |
+              /usr/local/bin/docker-setup.sh
+              /usr/local/bin/gitea -c "$GITEA_APP_INI" migrate
+              if out=$(/usr/local/bin/gitea -c "$GITEA_APP_INI" admin user create --admin \
+                    --username "$BOOTSTRAP_ADMIN_USERNAME" \
+                    --email "$BOOTSTRAP_ADMIN_EMAIL" \
+                    --password "$BOOTSTRAP_ADMIN_PASSWORD" \
+                    --must-change-password=false 2>&1); then
+                echo "bootstrap administrator created"
+              else
+                printf '%s\n' "$out"
+                case "$out" in
+                  *"already exist"*|*"already in use"*)
+                    echo "bootstrap administrator already present; leaving it alone" ;;
+                  *)
+                    exit 1 ;;
+                esac
+              fi
+          env:
+            - name: GITEA__database__DB_TYPE
+              value: postgres
+            - name: GITEA__database__HOST
+              secretRef: { vault: "[%instance_vault%]", key: db_host }
+            - name: GITEA__database__NAME
+              secretRef: { vault: "[%instance_vault%]", key: db_name }
+            - name: GITEA__database__USER
+              secretRef: { vault: "[%instance_vault%]", key: db_user }
+            - name: GITEA__database__PASSWD
+              secretRef: { vault: "[%instance_vault%]", key: db_password }
+            - name: GITEA__database__SSL_MODE
+              value: require
+            # The same lock the web container sets. It has to be here too:
+            # `migrate` and `admin user create` both call setting.MustInstalled,
+            # which refuses to run against a configuration that still thinks it
+            # is waiting for the install wizard.
+            - name: GITEA__security__INSTALL_LOCK
+              value: "true"
+            - name: GITEA__security__SECRET_KEY
+              secretRef: { vault: "[%instance_vault%]", key: secret_key }
+            - name: BOOTSTRAP_ADMIN_USERNAME
+              value: "[%admin_username%]"
+            - name: BOOTSTRAP_ADMIN_EMAIL
+              value: "[%admin_email%]"
+            - name: BOOTSTRAP_ADMIN_PASSWORD
+              secretRef: { vault: "[%instance_vault%]", key: admin_password }
+          mounts:
+            - volume: data
+              path: /var/lib/gitea
+            - volume: config
+              path: /etc/gitea
+
+      containers:
+        - name: gitea
+          image: docker.io/gitea/gitea
+          tag: "[%version%]-rootless"
+          # The image's ENTRYPOINT verbatim, with no arguments — given none,
+          # docker-entrypoint.sh execs `gitea -c "$GITEA_APP_INI" web`. Same
+          # reason as the init container for spelling it out at all: this
+          # container carries vault-backed env vars, and a container that does
+          # must declare its own argv.
+          command: [/usr/bin/dumb-init, --, /usr/local/bin/docker-entrypoint.sh]
+          ports:
+            - name: http
+              port: 3000
+            - name: ssh
+              port: 2222
+          env:
+            # ── Database ───────────────────────────────────────────────────
+            - name: GITEA__database__DB_TYPE
+              value: postgres
+            - name: GITEA__database__HOST
+              secretRef: { vault: "[%instance_vault%]", key: db_host }
+            - name: GITEA__database__NAME
+              secretRef: { vault: "[%instance_vault%]", key: db_name }
+            - name: GITEA__database__USER
+              secretRef: { vault: "[%instance_vault%]", key: db_user }
+            - name: GITEA__database__PASSWD
+              secretRef: { vault: "[%instance_vault%]", key: db_password }
+            # Not a parameter. The platform's PostgreSQL rejects unencrypted
+            # connections and Gitea's default is to make one; see the header.
+            - name: GITEA__database__SSL_MODE
+              value: require
+
+            # ── Identity of the installation ───────────────────────────────
+            # Locked, so the instance can never be configured by whoever
+            # reaches it first. The administrator is created by the init
+            # container above instead.
+            - name: GITEA__security__INSTALL_LOCK
+              value: "true"
+            - name: GITEA__security__SECRET_KEY
+              secretRef: { vault: "[%instance_vault%]", key: secret_key }
+            # Four underscores: the root section of the ini has no name.
+            - name: GITEA____APP_NAME
+              value: "[%app_name%]"
+
+            # ── Where Gitea thinks it lives ────────────────────────────────
+            # It cannot infer this behind a TLS-terminating ingress — it sees
+            # plain HTTP on a pod IP — and ROOT_URL is what every clone URL,
+            # webhook payload and notification link is built from. The trailing
+            # slash is Gitea's own convention for this value.
+            - name: GITEA__server__ROOT_URL
+              value: "https://[%ingress_host%]/"
+            - name: GITEA__server__DOMAIN
+              value: "[%ingress_host%]"
+            - name: GITEA__server__HTTP_PORT
+              value: "3000"
+
+            # ── Git over SSH ───────────────────────────────────────────────
+            # The built-in server, which is the only kind the rootless image
+            # supports. SSH_LISTEN_PORT is what the process binds; SSH_PORT is
+            # what it advertises in clone URLs. They are both 2222 because a
+            # loadBalancer endpoint publishes the container's own port number —
+            # so the URLs Gitea hands out are the URLs that work. The user in
+            # them is `git`, from the image's BUILTIN_SSH_SERVER_USER.
+            - name: GITEA__server__START_SSH_SERVER
+              value: "true"
+            - name: GITEA__server__SSH_LISTEN_PORT
+              value: "2222"
+            - name: GITEA__server__SSH_PORT
+              value: "2222"
+            - name: GITEA__server__SSH_DOMAIN
+              value: "[%ssh_host%]"
+
+            # Git LFS, served on the web port and stored under /var/lib/gitea/
+            # git/lfs — on the repository volume, not in the database. Pinned
+            # on because the image's own template leaves the value blank, which
+            # an ini reads as false: a Gitea that silently cannot take LFS
+            # objects is discovered by the first person pushing a large file.
+            - name: GITEA__server__LFS_START_SERVER
+              value: "true"
+
+            # ── Who may do what ────────────────────────────────────────────
+            - name: GITEA__service__DISABLE_REGISTRATION
+              value: "[%disable_registration%]"
+            - name: GITEA__service__REQUIRE_SIGNIN_VIEW
+              value: "[%require_signin%]"
+            # New repositories default to private. Gitea's own default is
+            # "last", which repeats whatever the last creator chose — a
+            # reasonable default for a forge on a private network and the wrong
+            # one for a hostname on the public internet, where the cost of the
+            # two mistakes is not symmetric. Every repository can still be made
+            # public from its settings page.
+            - name: GITEA__repository__DEFAULT_PRIVATE
+              value: private
+
+            # Gitea calls dl.gitea.com once a week to see whether a newer
+            # version exists. Off here, on by default upstream. Nothing about it
+            # is hostile — it is a version check, not analytics — but a private
+            # forge is a place where "no outbound calls unless asked for" is the
+            # better default. Watch the releases feed instead; the `version`
+            # parameter above is how an upgrade happens either way.
+            - name: GITEA__cron.update_checker__ENABLED
+              value: "false"
+
+            # Not set here, and each for a reason worth knowing:
+            #
+            #   [mailer] — no SMTP, so this instance sends no mail. That is
+            #     fine until someone needs a password reset or an issue
+            #     notification; the settings are GITEA__mailer__ENABLED, SMTP_
+            #     ADDR, FROM, USER and PASSWD, and PASSWD belongs in the vault
+            #     rather than in a component sheet.
+            #   [actions] — Gitea Actions is ENABLED by default and does
+            #     nothing until you register a runner (act_runner) against it.
+            #     A runner executes whatever a repository's workflow says, so
+            #     it is its own deployment and its own trust decision.
+            #   [metrics] — Prometheus metrics, off by default and served on
+            #     the same port as the web UI, so turning it on publishes it on
+            #     the ingress too. Pair it with ENABLED_ISSUE_BY_LABEL only if
+            #     you want the cardinality.
+            #   [picture] DISABLE_GRAVATAR — deliberately absent: as of 1.27
+            #     this moved out of the ini and into the database, and setting
+            #     it here only logs a deprecation notice. The toggle is in Site
+            #     Administration → Configuration, and it is worth visiting if
+            #     you would rather your users' avatars not be fetched from
+            #     gravatar.com by every browser that opens a pull request.
+          probes:
+            # /api/healthz is registered before Gitea's session and auth
+            # middleware, so it answers unauthenticated even with
+            # require_signin on. It reports the database and the cache, which
+            # is exactly what readiness should depend on.
+            readiness:
+              type: http
+              port: http
+              path: /api/healthz
+              periodSeconds: 10
+              timeoutSeconds: 5
+              failureThreshold: 3
+            # TCP, and deliberately NOT /api/healthz. A database outage should
+            # take this pod out of the load balancer, not restart it in a loop:
+            # /api/healthz answers 424 while the database is away, and a
+            # liveness probe reading that would turn a recoverable outage into
+            # a crash loop that outlives it.
+            liveness:
+              type: tcp
+              port: http
+              periodSeconds: 20
+              timeoutSeconds: 5
+              failureThreshold: 3
+            # Ten minutes, and the reason is upgrades rather than first starts.
+            # A fresh instance migrates an empty database in seconds; a major
+            # upgrade runs the new version's migrations against real data, and
+            # the web server does not open its port until they finish. A budget
+            # that is merely typical turns a long, correct migration into a
+            # crash loop — and a migration interrupted halfway is the expensive
+            # kind of failure.
+            startup:
+              type: http
+              port: http
+              path: /api/healthz
+              initialDelaySeconds: 10
+              periodSeconds: 5
+              failureThreshold: 120
+          mounts:
+            - volume: data
+              path: /var/lib/gitea
+            - volume: config
+              path: /etc/gitea
+
+      volumes:
+        # Repositories, LFS objects, attachments, avatars, the bleve issue
+        # index, the queues, and the SSH host keys the server generates on
+        # first start. Losing this is losing the forge; the database on its own
+        # would restore a Gitea that knows about repositories it no longer has.
+        - name: data
+          persistent:
+            size: "[%storage_size%]"
+            tier: standard
+            # uid and gid are both 1000 in this image. A fresh volume arrives
+            # empty and root-owned, and without this the entrypoint cannot
+            # create the git home directory it needs before anything else.
+            fsGroup: 1000
+        # app.ini, and only app.ini — a few kilobytes on a volume of its own.
+        # Not an emptyDir, and that is the whole point: Gitea writes
+        # INTERNAL_TOKEN, LFS_JWT_SECRET and the OAuth2 JWT secret into this
+        # file and expects to find them again. Fixed at 1Gi rather than offered
+        # as a parameter, because there is no answer to give — provisioners
+        # round up to a gibibyte anyway and nothing here will ever fill one.
+        - name: config
+          persistent:
+            size: "1Gi"
+            tier: standard
+            fsGroup: 1000
+
+  endpoints:
+    # The web UI, the REST API and git-over-HTTPS, all on one hostname.
+    #
+    # No authGuard, deliberately. Gitea has real user management of its own —
+    # accounts, organisations, teams, OAuth2 and OIDC sign-in — and putting the
+    # platform's interactive sign-in in front of the whole host would break
+    # every `git clone` and every CI checkout on it, because `git` cannot
+    # complete a browser login. What protects this endpoint is Gitea's own
+    # authentication, with self-registration closed by default above.
+    - name: web
+      component: gitea
+      port: http
+      expose: ingress
+      hostname: "[%ingress_host%]"
+      issuer: "[%ingress_certificate_issuer%]"
+
+    # Git over SSH, on its own load-balancer address. Raw TCP, so it cannot go
+    # through the ingress at all — the ingress controller terminates TLS and
+    # speaks HTTP, and the SSH protocol is neither.
+    #
+    # It takes no hostname: a loadBalancer endpoint is addressed by the IP its
+    # load balancer assigns, which the platform surfaces once it appears. Point
+    # `ssh_host` at that address with an A record and the clone URLs Gitea
+    # advertises start working. Until then, nothing about the web endpoint is
+    # affected.
+    - name: ssh
+      condition: ssh_enabled
+      component: gitea
+      port: ssh
+      expose: loadBalancer
