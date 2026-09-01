@@ -408,6 +408,17 @@ instance:
           command: [/bin/sh, -ec]
           args:
             - |
+              # The database credentials and the secret key arrive under
+              # BOOTSTRAP_ names: a vault-backed env var name has to be unique
+              # across the containers of a component, and the web container
+              # below already claims the GITEA__ spellings. docker-setup.sh
+              # reads the GITEA__ environment, so put them back under the names
+              # it expects before it runs.
+              export GITEA__database__HOST="$BOOTSTRAP_DB_HOST"
+              export GITEA__database__NAME="$BOOTSTRAP_DB_NAME"
+              export GITEA__database__USER="$BOOTSTRAP_DB_USER"
+              export GITEA__database__PASSWD="$BOOTSTRAP_DB_PASSWORD"
+              export GITEA__security__SECRET_KEY="$BOOTSTRAP_SECRET_KEY"
               /usr/local/bin/docker-setup.sh
               /usr/local/bin/gitea -c "$GITEA_APP_INI" migrate
               if out=$(/usr/local/bin/gitea -c "$GITEA_APP_INI" admin user create --admin \
@@ -428,13 +439,16 @@ instance:
           env:
             - name: GITEA__database__DB_TYPE
               value: postgres
-            - name: GITEA__database__HOST
+            # Renamed, not duplicated — see the args above. Only the five
+            # vault-backed names collide with the web container; the plain
+            # values are free to keep their GITEA__ spelling here.
+            - name: BOOTSTRAP_DB_HOST
               secretRef: { vault: "[%instance_vault%]", key: db_host }
-            - name: GITEA__database__NAME
+            - name: BOOTSTRAP_DB_NAME
               secretRef: { vault: "[%instance_vault%]", key: db_name }
-            - name: GITEA__database__USER
+            - name: BOOTSTRAP_DB_USER
               secretRef: { vault: "[%instance_vault%]", key: db_user }
-            - name: GITEA__database__PASSWD
+            - name: BOOTSTRAP_DB_PASSWORD
               secretRef: { vault: "[%instance_vault%]", key: db_password }
             - name: GITEA__database__SSL_MODE
               value: require
@@ -444,7 +458,7 @@ instance:
             # is waiting for the install wizard.
             - name: GITEA__security__INSTALL_LOCK
               value: "true"
-            - name: GITEA__security__SECRET_KEY
+            - name: BOOTSTRAP_SECRET_KEY
               secretRef: { vault: "[%instance_vault%]", key: secret_key }
             - name: BOOTSTRAP_ADMIN_USERNAME
               value: "[%admin_username%]"
