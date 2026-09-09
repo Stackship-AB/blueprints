@@ -225,7 +225,18 @@ instance:
           # — setting `command` replaces it. Omit these and all five database
           # settings below are resolved and then silently dropped.
           command: [/opt/keycloak/bin/kc.sh]
-          args: [start]
+          # `--import-realm` reads every regular .json file in
+          # /opt/keycloak/data/import at startup, which the volume below supplies.
+          # It ships enabled rather than as a parameter because it costs an empty
+          # directory scan when there is nothing to import, and adding it later
+          # means editing argv on a running instance — the one edit a person
+          # deploying a realm is least equipped to get right.
+          #
+          # First-boot semantics, not a sync: a realm that already exists is
+          # SKIPPED, so changing the file below re-rolls the pod and imports
+          # nothing. Re-importing a changed realm means deleting it in the console
+          # first, or running `kc.sh import --override true` yourself.
+          args: [start, --import-realm]
           # No JAVA_OPTS here on purpose. kc.sh sizes the heap from the
           # container's memory limit — MaxRAMPercentage=70 — but only when
           # KC_RUN_IN_CONTAINER is true, and the image sets exactly that in its
@@ -325,6 +336,36 @@ instance:
               periodSeconds: 20
               timeoutSeconds: 5
               failureThreshold: 3
+          # The whole volume, not a subPath of it. A subPath names one key, and a
+          # key that does not exist yet leaves the pod stuck in ContainerCreating —
+          # which is exactly the state a template shipping a placeholder would put
+          # every deployment in. Mounting the directory is safe here because the
+          # image has nothing of its own in data/import to hide.
+          mounts:
+            - volume: realm-import
+              path: /opt/keycloak/data/import
+              readOnly: true
+      volumes:
+        # Literal content, materialized by the platform as a ConfigMap it owns.
+        # The placeholder is not decoration: a files volume must declare at least
+        # one file, so there is no way to ship the mount and the argv without
+        # shipping something to put in it. Keycloak ignores it — only .json is
+        # read — which is what makes it a safe thing to leave in place.
+        #
+        # To import a realm, replace this content with your export as realm.json.
+        # It travels in the instance spec, so it survives a recreate and shows up
+        # in revisions, unlike a file uploaded onto a disk. The ceiling is 900 KiB
+        # for the volume as a whole; a realm exported WITHOUT users generally fits,
+        # one exported with them generally does not. Mark the volume `sensitive:
+        # true` if the export carries client secrets, and read the note in the
+        # portal about the `<redacted>` marker before editing it a second time.
+        - name: realm-import
+          files:
+            content:
+              README.txt: |
+                Replace this volume's content with your realm export, as realm.json.
+                Keycloak imports it on the next start, and skips any realm that
+                already exists.
 
   endpoints:
     # If a login round-trip returns 502 from an nginx ingress controller, this
