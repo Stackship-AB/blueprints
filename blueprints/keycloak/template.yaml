@@ -71,7 +71,7 @@ metadata:
     OAuth 2.0 and SAML, user federation against LDAP or Active Directory, social
     login, and fine-grained authorization — with an admin console and a
     self-service account console for your users.
-  version: "26.7.2"
+  version: "26.7.3"
   category: Platforms
   tags: [keycloak, identity, sso, oidc, oauth2, saml, auth, iam]
   documentation: https://www.keycloak.org/documentation
@@ -84,8 +84,8 @@ parameters:
       Tag on docker.io/keycloak/keycloak. A minor tag such as "26.7" follows its
       patch releases, which is how a fix reaches you without an edit; pin the
       exact patch for an installation that must not move on its own.
-    options: ["26.7.2", "26.7", "26.6"]
-    default: "26.7.2"
+    options: ["26.7.3", "26.7"]
+    default: "26.7.3"
     documentation: https://hub.docker.com/r/keycloak/keycloak
 
   - name: compute_plan

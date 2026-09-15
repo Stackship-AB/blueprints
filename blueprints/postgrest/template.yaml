@@ -96,7 +96,7 @@ metadata:
     pagination, resource embedding across foreign keys and an OpenAPI description,
     all enforced by the database's own permissions rather than by hand-written
     code. Ships with a Stackship-managed PostgreSQL behind it.
-  version: "16.2"
+  version: "16.3"
   category: Databases
   tags: [postgrest, api, rest, postgres, database, openapi, jwt]
   documentation: https://docs.postgrest.org/en/stable/
@@ -109,10 +109,9 @@ parameters:
       Tag on docker.io/postgrest/postgrest. PostgREST numbers releases
       MAJOR.PATCH and only ships even majors. v16 dropped support for PostgreSQL
       13 and changed the syntax of one config value (jwt-role-claim-key, which
-      this template deliberately leaves at its default so the choice here is
-      safe either way); v14 is the previous series and still gets patches.
-    options: ["v16.2", "v16.1", "v14.17"]
-    default: "v16.2"
+      this template deliberately leaves at its default).
+    options: ["v16.3"]
+    default: "v16.3"
     documentation: https://github.com/PostgREST/postgrest/blob/main/CHANGELOG.md
 
   - name: compute_plan

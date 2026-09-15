@@ -79,7 +79,7 @@ metadata:
     instead of one. Speaks the Redis protocol, so existing clients connect
     unchanged — with vertical scaling to hundreds of gigabytes in a single
     process, snapshots that do not fork, and no cluster to operate.
-  version: "1.40.1"
+  version: "1.40.2"
   category: Databases
   tags: [dragonfly, redis, valkey, memcached, cache, key-value, in-memory]
   documentation: https://www.dragonflydb.io/docs
@@ -93,8 +93,8 @@ parameters:
       installation that must not move on its own — there is no floating stable
       tag here worth using, since `latest` follows every release including the
       one published an hour ago.
-    options: ["v1.40.1", "v1.39.0", "v1.38.1"]
-    default: "v1.40.1"
+    options: ["v1.40.2"]
+    default: "v1.40.2"
     documentation: https://github.com/dragonflydb/dragonfly/releases
 
   - name: compute_plan

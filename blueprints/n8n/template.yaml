@@ -79,7 +79,7 @@ metadata:
     gaps where a node does not exist. Self-hosted, so the credentials and the
     data stay in your own cluster — with a Stackship-managed PostgreSQL behind
     it.
-  version: "2.36.7"
+  version: "2.39.5"
   category: Platforms
   tags: [n8n, automation, workflow, integration, webhooks, low-code, ai]
   documentation: https://docs.n8n.io/hosting/
@@ -94,8 +94,8 @@ parameters:
       upstream moves to each stable release — convenient, and note that it will
       carry you across a MAJOR version without asking, which for n8n means
       breaking changes in both workflows and configuration.
-    options: ["2.36.7", "2.35.7", "stable"]
-    default: "2.36.7"
+    options: ["2.39.5", "stable"]
+    default: "2.39.5"
     documentation: https://github.com/n8n-io/n8n/releases
 
   - name: compute_plan
