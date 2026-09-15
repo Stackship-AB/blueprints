@@ -147,6 +147,61 @@ parameters:
     default: "{{cert_issuer}}"
     advanced: true
 
+  # ── Custom theme ──────────────────────────────────────────────────────────
+  #
+  # A theme is a .jar, and it reaches Keycloak as an IMAGE pulled through one of
+  # the boundary's deployment sources rather than as a URL fetched at startup.
+  # The kubelet pulls it, so the pod needs no egress; a restart reuses the
+  # node's cached image instead of downloading again; a digest in theme_tag pins
+  # the exact bytes; and the registry credential never enters the pod. See the
+  # init container below for what the image must contain.
+  #
+  # REQUIRES the backend that knows the DeploymentSource parameter type and
+  # per-container `condition`. An older one rejects this file by name and keeps
+  # serving the previous revision of the blueprint.
+  - name: theme_enabled
+    type: Boolean
+    label: Custom Theme
+    description: >-
+      Load theme .jar files from an image into Keycloak's providers directory.
+      Choose the theme per realm afterwards, in the admin console or with
+      loginTheme in an imported realm.json.
+    default: "false"
+    advanced: true
+
+  - name: theme_source
+    type: DeploymentSource
+    capability: ImagePull
+    label: Theme Registry
+    description: >-
+      The private registry the theme image is pulled through. Leave it at none
+      for a public image.
+    default: ""
+    advanced: true
+
+  - name: theme_image
+    type: String
+    label: Theme Image
+    description: >-
+      Repository of the theme image, without a tag, e.g. ghcr.io/acme/keycloak-theme.
+      Its /theme directory must hold the .jar files, and it needs /bin/sh and
+      cp — FROM busybox with a COPY into /theme is enough. A theme jar can carry
+      code as well as CSS, so only use an image you trust.
+    default: ""
+    advanced: true
+    validation:
+      pattern: "^([a-z0-9]+([._-][a-z0-9]+)*(:[0-9]+)?/)*[a-z0-9]+([._-][a-z0-9]+)*$"
+      message: Must be an image repository without a tag, e.g. ghcr.io/acme/keycloak-theme
+
+  - name: theme_tag
+    type: String
+    label: Theme Tag
+    description: >-
+      Tag or digest of the theme image. A sha256 digest pins the theme's exact
+      content; a moving tag changes nothing until the pod next restarts.
+    default: "latest"
+    advanced: true
+
 outputs:
   - name: console_url
     label: Admin Console
@@ -214,6 +269,30 @@ instance:
       # the group-writable bit the augmentation relies on.
       runAsUser: 1000
       computePlan: "[%compute_plan%]"
+      initContainers:
+        # Copies the theme image's jars into the providers volume, which the
+        # keycloak container mounts over /opt/keycloak/providers. No download:
+        # the kubelet has already pulled the image, through theme_source when
+        # one is set. `start` without --optimized re-runs augmentation on every
+        # boot, and augmentation is what picks new providers up.
+        #
+        # Gated as a whole rather than left to exit early, because an empty
+        # theme_image is not an image the platform will accept at all.
+        #
+        # The ls fails the pod with Init:Error when /theme holds no jar, rather
+        # than starting Keycloak without the theme someone asked for. It runs as
+        # uid 1000 like the rest of the component, so the jars must be readable
+        # by it — which files added by a Dockerfile COPY are.
+        - name: theme
+          condition: theme_enabled
+          image: "[%theme_image%]"
+          tag: "[%theme_tag%]"
+          sourceRef: "[%theme_source%]"
+          command: ["/bin/sh"]
+          args: ["-c", "set -eu; ls /theme/*.jar >/dev/null; cp /theme/*.jar /providers/"]
+          mounts:
+            - volume: providers
+              path: /providers
       containers:
         - name: keycloak
           image: docker.io/keycloak/keycloak
@@ -345,7 +424,17 @@ instance:
             - volume: realm-import
               path: /opt/keycloak/data/import
               readOnly: true
+            # Always mounted, theme or not: an empty directory is simply no
+            # providers.
+            - volume: providers
+              path: /opt/keycloak/providers
+              readOnly: true
       volumes:
+        # Filled by the theme init container, when there is one. Jars only, so
+        # it lives and dies with the pod.
+        - name: providers
+          emptyDir:
+            sizeLimit: "50Mi"
         # Literal content, materialized by the platform as a ConfigMap it owns.
         # The placeholder is not decoration: a files volume must declare at least
         # one file, so there is no way to ship the mount and the argv without

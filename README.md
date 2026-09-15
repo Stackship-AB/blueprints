@@ -19,6 +19,11 @@ over `metadata.slug` if the two disagree.
 Only `blueprints/` is walked. Everything else in this repository — this README,
 tooling, CI — is ignored by the seeder.
 
+## Guides
+
+- [Keycloak: a custom theme from your own registry](./docs/keycloak-custom-theme.md) —
+  build a theme repository, publish it as an image, and deploy Keycloak with it.
+
 ## Pointing a cluster at your own catalog
 
 Fork this repository (or build one with the same layout, public over HTTPS) and
