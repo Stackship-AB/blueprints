@@ -67,7 +67,7 @@ metadata:
     Anthropic, Bedrock, Vertex, Azure and a hundred more behind one API and one
     set of keys. Issue virtual keys per team or per application, give each a
     budget and a rate limit, and see what was spent on what.
-  version: "1.97.0"
+  version: "1.101.0"
   category: AI
   tags: [litellm, ai, llm, gateway, proxy, openai, anthropic, postgres]
   documentation: https://docs.litellm.ai/docs/simple_proxy
@@ -81,8 +81,8 @@ parameters:
       installation that must not move on its own; "main-stable" follows each
       stable release, which is how a fix reaches you without an edit — and also
       how a minor version reaches you without one.
-    options: ["v1.97.0", "v1.96.2", "main-stable"]
-    default: "v1.97.0"
+    options: ["v1.101.0", "main-stable"]
+    default: "v1.101.0"
     documentation: https://github.com/BerriAI/litellm/pkgs/container/litellm-non_root
 
   - name: compute_plan

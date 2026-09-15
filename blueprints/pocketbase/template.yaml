@@ -14,8 +14,8 @@ kind: BlueprintTemplate
 #     `version` parameter stays a bare PocketBase version, matching
 #     metadata.version and what the release notes call it.
 #   - It does not mirror every upstream patch (0.39.4 and 0.37.4/.5 were never
-#     published, for instance), so every option below is a tag confirmed to
-#     resolve rather than the newest upstream patch of that minor.
+#     published, and it lags upstream releases), so the option below is the
+#     newest tag confirmed to resolve rather than the newest upstream patch.
 #   - Its entrypoint is `pocketbase serve --http=0.0.0.0:8090 --dir=/pb_data`
 #     running as the non-root `pocketbase` user, which is why the volume mounts
 #     at /pb_data and why fsGroup below is load-bearing: it is what leaves the
@@ -27,7 +27,7 @@ metadata:
   description: >-
     PocketBase is an open source backend consisting of a realtime database,
     authentication, file storage, and more.
-  version: "0.39.11"
+  version: "0.40.1"
   category: Databases
   tags: [pocketbase, database, realtime, auth, file-storage]
   documentation: https://pocketbase.io/docs/
@@ -37,8 +37,8 @@ parameters:
     type: Select
     label: PocketBase Version
     description: PocketBase release to run
-    options: ["0.39.11", "0.38.2", "0.37.3"]
-    default: "0.39.11"
+    options: ["0.40.1"]
+    default: "0.40.1"
 
   - name: storage_size
     type: Select

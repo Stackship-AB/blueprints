@@ -145,7 +145,7 @@ parameters:
       must not move on its own. Gitea's upgrades are one-way: the first start on
       a new version migrates the database and the old binary will not open it
       again.
-    options: ["1.27.3", "1.27", "1.26"]
+    options: ["1.27.3", "1.27"]
     default: "1.27.3"
     documentation: https://github.com/go-gitea/gitea/releases
 

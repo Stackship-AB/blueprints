@@ -81,7 +81,7 @@ metadata:
     deploys its HTTP services — admin console, JMAP, CalDAV, CardDAV and WebDAV —
     on a Stackship-managed PostgreSQL. The SMTP, IMAP and POP3 listeners bind
     privileged ports and are not reachable on this platform.
-  version: "0.16.18"
+  version: "0.16.22"
   category: Platforms
   tags: [stalwart, mail, jmap, caldav, carddav, webdav, groupware, collaboration]
   documentation: https://stalw.art/docs/install/platform/docker/
@@ -94,8 +94,8 @@ parameters:
       Stalwart release to run. Only the 0.16 line is offered: it is the first
       that reads the JSON data-store file this template writes, and 0.15 and
       earlier would ignore it and drop into the bootstrap wizard.
-    options: ["0.16.18", "0.16.17", "0.16.16"]
-    default: "0.16.18"
+    options: ["0.16.22"]
+    default: "0.16.22"
 
   - name: db_availability
     type: Select
