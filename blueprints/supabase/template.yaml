@@ -157,6 +157,7 @@ instance:
       runAsUser: 100
       runAsGroup: 101
       computePlan: medium
+      minComputePlan: medium
       cpu: 250m
       memory: 1Gi
       containers:
@@ -259,6 +260,7 @@ instance:
     - name: auth
       startupOrder: 2
       computePlan: small
+      minComputePlan: small
       containers:
         - name: auth
           image: registry.stackship.se/blueprints/supabase/gotrue
@@ -327,6 +329,7 @@ instance:
     - name: rest
       startupOrder: 2
       computePlan: small
+      minComputePlan: small
       containers:
         - name: rest
           image: registry.stackship.se/blueprints/supabase/postgrest
@@ -375,6 +378,7 @@ instance:
     - name: realtime
       startupOrder: 2
       computePlan: medium
+      minComputePlan: medium
       containers:
         - name: realtime
           image: registry.stackship.se/blueprints/supabase/realtime
@@ -477,6 +481,7 @@ instance:
     - name: storage
       startupOrder: 2
       computePlan: small
+      minComputePlan: small
       containers:
         - name: storage
           image: registry.stackship.se/blueprints/supabase/storage-api
@@ -554,6 +559,7 @@ instance:
     - name: meta
       startupOrder: 2
       computePlan: small
+      minComputePlan: small
       containers:
         - name: meta
           image: registry.stackship.se/blueprints/supabase/postgres-meta
@@ -605,6 +611,7 @@ instance:
     - name: gateway
       startupOrder: 3
       computePlan: small
+      minComputePlan: small
       containers:
         - name: kong
           image: registry.stackship.se/blueprints/supabase/kong
@@ -848,6 +855,7 @@ instance:
     - name: imgproxy
       startupOrder: 3
       computePlan: small
+      minComputePlan: small
       containers:
         - name: imgproxy
           image: registry.stackship.se/blueprints/supabase/imgproxy
@@ -884,6 +892,7 @@ instance:
     - name: functions
       startupOrder: 3
       computePlan: small
+      minComputePlan: small
       initContainers:
         # Seeds the persistent functions dir from the packaged entrypoint on
         # first boot only, so a user's own edits survive a restart.
@@ -1055,6 +1064,7 @@ instance:
     - name: studio
       startupOrder: 4
       computePlan: medium
+      minComputePlan: medium
       containers:
         - name: studio
           image: registry.stackship.se/blueprints/supabase/studio
