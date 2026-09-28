@@ -625,7 +625,7 @@ instance:
           # config from the vault-backed env before Kong reads it. sed (not a
           # bash `eval`) because kong.tmpl is full of double quotes; the JWTs are
           # base64url so `#` is a safe delimiter. The declarative config is
-          # written to kong.yml (kong's writable home) from the read-only
+          # written to /kong-runtime/kong.yml (an emptyDir) from the read-only
           # kong.tmpl mount; the whole command is still wrapped by the
           # secret-exec shim so ANON_KEY / SERVICE_ROLE_KEY are in the env here.
           command:
@@ -634,7 +634,7 @@ instance:
             - |
               set -e
               sed "s#__ANON_KEY__#${ANON_KEY}#g; s#__SERVICE_ROLE_KEY__#${SERVICE_ROLE_KEY}#g" \
-                /home/kong/kong.tmpl > /home/kong/kong.yml
+                /home/kong/kong.tmpl > /kong-runtime/kong.yml
               exec /entrypoint.sh kong docker-start
           ports:
             - name: http
@@ -645,7 +645,7 @@ instance:
             - name: KONG_DATABASE
               value: "off"
             - name: KONG_DECLARATIVE_CONFIG
-              value: "/home/kong/kong.yml"
+              value: "/kong-runtime/kong.yml"
             - name: KONG_DNS_ORDER
               value: "LAST,A,CNAME"
             - name: KONG_PLUGINS
@@ -682,7 +682,15 @@ instance:
               path: /home/kong/kong.tmpl
               subPath: kong.yml
               readOnly: true
+            # The resolved config is written here, not next to kong.tmpl: the
+            # image has no /home/kong of its own, so the kubelet creates it
+            # root-owned for the mount above and Kong's user cannot write in it.
+            - volume: runtime
+              path: /kong-runtime
       volumes:
+        - name: runtime
+          emptyDir:
+            sizeLimit: "1Mi"
         - name: config
           files:
             content:
