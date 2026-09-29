@@ -25,7 +25,7 @@ metadata:
     Self-hosted Supabase — open source Firebase alternative with PostgreSQL
     database, authentication, instant APIs, realtime subscriptions, storage, and
     Studio dashboard.
-  version: "3.1"
+  version: "3.2"
   category: Databases
   tags: [supabase, database, auth, storage, realtime, api, postgres]
   documentation: https://supabase.com/docs/guides/self-hosting
@@ -445,6 +445,12 @@ instance:
               secretRef: { vault: "[%instance_vault%]", key: jwt_secret }
             - name: SEED_SELF_HOST
               value: "true"
+            # Realtime resolves the tenant from the first label of the Host
+            # header, and Kong forwards Host as the upstream service name. The
+            # seeded tenant must carry that name; upstream's default,
+            # realtime-dev, matches only its docker-compose hostname.
+            - name: SELF_HOST_TENANT_NAME
+              value: "[%name%]-realtime"
             - name: RUN_JANITOR
               value: "true"
             - name: RLIMIT_NOFILE
@@ -587,8 +593,11 @@ instance:
               value: "5432"
             - name: PG_META_DB_NAME
               value: "postgres"
+            # The same role Studio's SQL editor uses. As `postgres`, /pg/ calls
+            # made with the service_role key cannot alter tables created in
+            # Studio, which belong to supabase_admin.
             - name: PG_META_DB_USER
-              value: "postgres"
+              value: "supabase_admin"
             - name: PG_META_DB_PASSWORD
               secretRef: { vault: "[%instance_vault%]", key: db_password }
             - name: CRYPTO_KEY
