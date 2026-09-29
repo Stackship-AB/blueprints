@@ -12,7 +12,7 @@ metadata:
   description: >-
     Collect data from databases, APIs and files, transform it on the way in,
     build views visually, and publish them as versioned REST endpoints.
-  version: "2.1"
+  version: "2.2"
   category: Platforms
   tags: [stackship, data, etl, ingestion, analytics, postgres, api]
   documentation: https://gitlab.stackship.se/stackship-apps/data-lake/-/blob/main/DRIFT.md
@@ -247,9 +247,11 @@ instance:
         - name: web
           image: registry.stackship.se/datahub/web
           tag: "[%image_tag%]"
+          # The image has listened on 8080 since the Aug-20 build; declaring 80
+          # points the probes at a closed port and the pod never goes Ready.
           ports:
             - name: http
-              port: 80
+              port: 8080
           probes:
             readiness:
               type: http
