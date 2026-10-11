@@ -27,7 +27,7 @@ metadata:
   description: >-
     PocketBase is an open source backend consisting of a realtime database,
     authentication, file storage, and more.
-  version: "0.40.1"
+  version: "0.40.5"
   category: Databases
   tags: [pocketbase, database, realtime, auth, file-storage]
   documentation: https://pocketbase.io/docs/
@@ -37,8 +37,8 @@ parameters:
     type: Select
     label: PocketBase Version
     description: PocketBase release to run
-    options: ["0.40.1"]
-    default: "0.40.1"
+    options: ["0.40.5"]
+    default: "0.40.5"
 
   - name: storage_size
     type: Select

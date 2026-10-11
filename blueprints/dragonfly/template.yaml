@@ -15,7 +15,8 @@ kind: BlueprintTemplate
 #
 #   1. DFLY_PASSWORD IS FATAL. It is the variable the upstream chart's
 #      `passwordFromSecret` sets and the one --requirepass's own help text
-#      recommends, and on v1.40.1 the process dies before it opens a port:
+#      recommends, and on v1.40.1 (and still on v2.0.2) the process dies before
+#      it opens a port:
 #      "F dfly_main.cc:1058] unknown environment variable DFLY_PASSWORD".
 #      Dragonfly maps DFLY_<flag> onto its flags by EXACT name, and LOG(FATAL)s
 #      on any DFLY_ variable that is not one — and there is no flag called
@@ -79,7 +80,7 @@ metadata:
     instead of one. Speaks the Redis protocol, so existing clients connect
     unchanged — with vertical scaling to hundreds of gigabytes in a single
     process, snapshots that do not fork, and no cluster to operate.
-  version: "1.40.2"
+  version: "2.0.2"
   category: Databases
   tags: [dragonfly, redis, valkey, memcached, cache, key-value, in-memory]
   documentation: https://www.dragonflydb.io/docs
@@ -93,8 +94,8 @@ parameters:
       installation that must not move on its own — there is no floating stable
       tag here worth using, since `latest` follows every release including the
       one published an hour ago.
-    options: ["v1.40.2"]
-    default: "v1.40.2"
+    options: ["v2.0.2"]
+    default: "v2.0.2"
     documentation: https://github.com/dragonflydb/dragonfly/releases
 
   - name: compute_plan

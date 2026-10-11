@@ -25,7 +25,10 @@ kind: BlueprintTemplate
 # the platform's memory-backed /tmp (which is where GITEA_TEMP lives) and the
 # two persistent volumes, Gitea migrated an empty database, served the web UI,
 # generated its SSH host keys, and completed an HTTP clone, an HTTP push and an
-# SSH push — with nothing in the log about a read-only filesystem.
+# SSH push — with nothing in the log about a read-only filesystem. Measured
+# again on 28.1.0, upgrading that 1.27.3 database in place: the bootstrap's
+# migrate and its "already exists" branch, HTTP and SSH clone and push, and a
+# repository import from GitHub through the git egress proxy 28 introduced.
 #
 # ── Configuration: use the GITEA__ form, never the plain names ────────────────
 #
@@ -128,7 +131,7 @@ metadata:
     SSH. Light enough to run beside your other services, with a
     Stackship-managed PostgreSQL behind it and a bootstrap administrator whose
     password lands in the instance vault.
-  version: "1.27.3"
+  version: "28.1.0"
   category: Platforms
   tags: [gitea, git, forge, scm, version-control, code-review, ci, self-hosted]
   documentation: https://docs.gitea.com/
@@ -139,14 +142,14 @@ parameters:
     label: Gitea Version
     description: >-
       Tag on docker.io/gitea/gitea, always the `-rootless` variant — the plain
-      tags run s6-overlay and OpenSSH as root and cannot start here. A minor tag
-      such as "1.27" follows its patch releases, which is how a security fix
-      reaches you without an edit; pin the exact patch for an installation that
-      must not move on its own. Gitea's upgrades are one-way: the first start on
+      tags run s6-overlay and OpenSSH as root and cannot start here. A major tag
+      such as "28" follows its maintenance releases, which is how a security fix
+      reaches you without an edit; pin the exact release for an installation
+      that must not move on its own. Gitea's upgrades are one-way: the first start on
       a new version migrates the database and the old binary will not open it
       again.
-    options: ["1.27.3", "1.27"]
-    default: "1.27.3"
+    options: ["28.1.0", "28"]
+    default: "28.1.0"
     documentation: https://github.com/go-gitea/gitea/releases
 
   - name: compute_plan
