@@ -1,0 +1,370 @@
+apiVersion: blueprints.stackship.se/v2
+kind: BlueprintTemplate
+
+# ClickHouse from the project's own image, docker.io/clickhouse/clickhouse-server,
+# as a single node. Everything below was checked by running the image under the
+# same constraints the platform applies — read-only root filesystem, tmpfs /tmp,
+# a non-root uid, every capability dropped, a root-owned volume made writable
+# only through fsGroup — on both versions offered. What that turned up:
+#
+#   1. THE ENTRYPOINT'S USER SETUP CANNOT RUN HERE. Given CLICKHOUSE_PASSWORD,
+#      /entrypoint.sh writes the user into
+#      /etc/clickhouse-server/users.d/default-user.xml, which is on the read-only
+#      root. So that step is switched off (CLICKHOUSE_SKIP_USER_SETUP=1) and the
+#      user ships as a mounted file instead, reading its password from the
+#      environment with `from_env`. That way the password never appears in a
+#      file at all, and the entrypoint's own XML quoting of the password is no
+#      longer involved.
+#
+#   2. THE DEFAULT LOGGER WRITES TO /var/log. Also on the read-only root. The
+#      mounted config sends the server log to stderr instead, which is also
+#      where the platform collects it from.
+#
+#   3. IT WILL NOT DO REAL WORK ON `small`. On 250m/256Mi it starts, sits at
+#      about 146MiB idle, and fails a 5M-row INSERT with MEMORY_LIMIT_EXCEEDED.
+#      That counts as broken for a database, so minComputePlan is medium.
+#
+# The rest of the entrypoint does run and is useful: it creates CLICKHOUSE_DB on
+# first boot (but only on first boot, since it checks for an existing data
+# directory), and it runs as whatever uid it is given without trying to chown
+# or drop privileges.
+#
+# ── On the data ──────────────────────────────────────────────────────────────
+#
+# Everything ClickHouse persists lives under /var/lib/clickhouse: tables,
+# metadata, and the access directory where users and grants made with SQL
+# (CREATE USER, GRANT) are stored. That makes the volume the whole of the
+# database's state. It is retained on delete, as every persistent volume is by
+# default.
+#
+# ClickHouse also logs ABOUT ITSELF into tables on that same volume
+# (system.query_log, trace_log, metric_log and others), and in the stock config
+# most of them have no TTL at all — they grow until the disk is full. The
+# mounted config bounds them; see stackship.xml below.
+#
+# ── On replicas ──────────────────────────────────────────────────────────────
+#
+# One. A replicated ClickHouse is a cluster with ClickHouse Keeper and
+# ReplicatedMergeTree tables, set up deliberately. Raising the replica count
+# does not create one: it only adds a second pod that, with a ReadWriteOnce
+# volume, will not schedule.
+
+metadata:
+  slug: clickhouse
+  title: ClickHouse
+  description: >-
+    A column-oriented SQL database for real-time analytics. Queries over
+    billions of rows return in milliseconds, and the data compresses on disk
+    to a fraction of its raw size. Speaks HTTP and its own native protocol, so
+    every ClickHouse client, BI tool and driver connects unchanged.
+  version: "26.8.23.6"
+  category: Databases
+  tags: [clickhouse, database, olap, analytics, columnar, sql, time-series]
+  documentation: https://clickhouse.com/docs
+
+parameters:
+  - name: version
+    type: Select
+    label: ClickHouse Version
+    description: >-
+      Tag on docker.io/clickhouse/clickhouse-server. 26.8 is the current
+      long-term-support release, supported for a year, and the default for
+      that reason. 26.9 is the newest stable release, but stable releases are
+      supported only until three newer ones ship. Upgrading moves forward
+      safely. Downgrading after the new version has written data is not
+      guaranteed to work.
+    options: ["26.8.23.6", "26.9.15.5"]
+    default: "26.8.23.6"
+    documentation: https://clickhouse.com/docs/whats-new/changelog
+
+  - name: compute_plan
+    type: Select
+    label: Compute Plan
+    description: >-
+      ClickHouse caps its own memory at 90% of the container's limit and
+      refuses a query that would go over it, so the plan decides how large a
+      query, a join or an aggregation can get. On medium (500m/1Gi) about
+      920MiB is available, enough to load data and explore it. large
+      (2000m/4Gi) is the starting point for anything sustained. `small` is
+      not offered because it cannot complete a modest INSERT.
+    options: ["medium", "large"]
+    default: "medium"
+
+  - name: password
+    type: Secret
+    label: Password
+    description: >-
+      Password for the `default` user. Auto-generated; read it from the
+      instance vault. It is base64 rather than the default generator's
+      alphabet, so it survives being pasted into a shell. It can contain / +
+      and =, so percent-encode it before putting it inside a URL. There is no
+      passwordless mode in this blueprint: the stock image only allows that
+      from localhost, and a localhost-only database is not much use in a
+      container.
+    generate: true
+    generateSpec: base64
+    generateLength: 24
+
+  - name: database
+    type: String
+    label: Initial Database
+    description: >-
+      Created on first boot only. Renaming it here later does not rename or
+      create anything, because the entrypoint skips initialization once the
+      data directory exists. Create further databases with CREATE DATABASE.
+    default: "analytics"
+    validation:
+      # The entrypoint interpolates this into `CREATE DATABASE IF NOT EXISTS
+      # <name>` unquoted, so anything beyond a plain identifier is SQL.
+      pattern: "^[a-zA-Z_][a-zA-Z0-9_]{0,62}$"
+      message: Letters, digits and underscores, not starting with a digit
+
+  - name: storage_size
+    type: Select
+    label: Data Storage
+    description: >-
+      Volume for everything ClickHouse persists. Columnar compression usually
+      shrinks data to between a tenth and a third of its raw size. Merges,
+      however, temporarily need room for both the old and the new parts, so
+      a volume that is nearly full stops merging well before it stops
+      accepting inserts.
+    options: ["10Gi", "20Gi", "50Gi", "100Gi", "200Gi", "500Gi"]
+    default: "20Gi"
+
+  - name: expose_http
+    type: Boolean
+    label: HTTPS Endpoint
+    description: >-
+      Publishes the HTTP interface on a public hostname behind TLS. This is
+      how drivers, BI tools and the built-in SQL console at /play reach the
+      database from outside the cluster. Every request still needs the
+      password, sent as HTTP basic auth. Off by default: an analytics
+      database is usually queried from inside its own boundary.
+    default: "false"
+
+  - name: ingress_host
+    type: String
+    label: HTTPS Hostname
+    description: >-
+      Public hostname for the HTTPS endpoint, when it is switched on. Defaults
+      to the instance name under the platform domain.
+    default: "[%name%].{{domain_suffix}}"
+
+  - name: ingress_certificate_issuer
+    type: String
+    label: Certificate Issuer
+    description: cert-manager ClusterIssuer name
+    default: "{{cert_issuer}}"
+    advanced: true
+
+  - name: expose_native
+    type: Boolean
+    label: Native Protocol From Outside The Cluster
+    description: >-
+      Allocates a LoadBalancer carrying port 9000, the native protocol that
+      clickhouse-client and most high-throughput drivers use. That port is
+      unencrypted and authenticated by the password alone. Nothing terminates
+      TLS in front of it the way the HTTPS endpoint above does, so use it for
+      a developer's laptop, not as the normal way in.
+    default: "false"
+
+outputs:
+  - name: host
+    label: Hostname
+    description: >-
+      In-cluster address of this instance. Any component in the same boundary
+      connects to it here, on either port below.
+    type: String
+    value: "[%name%]-clickhouse"
+  - name: http_port
+    label: HTTP Port
+    description: The HTTP interface, which most drivers and every BI tool can use
+    type: String
+    value: "8123"
+  - name: native_port
+    label: Native Port
+    description: The native protocol, used by clickhouse-client and native drivers
+    type: String
+    value: "9000"
+  - name: user
+    label: User
+    description: >-
+      Has full rights, including CREATE USER and GRANT. Create a narrower user
+      for each application rather than sharing this one.
+    type: String
+    value: "default"
+  - name: database
+    label: Database
+    type: String
+    value: "[%database%]"
+  - name: connect
+    label: Connect
+    description: Read `password` from the instance vault and substitute it.
+    type: String
+    value: "clickhouse-client --host [%name%]-clickhouse --user default --password \"$PASSWORD\" --database [%database%]"
+  - name: https_url
+    label: HTTPS Endpoint
+    description: >-
+      Only answers when the HTTPS endpoint is switched on. /play is the
+      built-in SQL console.
+    type: Url
+    value: "https://[%ingress_host%]/play"
+
+instance:
+  components:
+    - name: clickhouse
+      # The ClusterIP Service is {instance}-{component}, so this name is the
+      # second half of the hostname in the outputs. Renaming it changes every
+      # client's address.
+      startupOrder: 1
+      # See the header. Do not raise this; it is not a cluster.
+      replicas: 1
+      # Verified: read-only root, tmpfs /tmp (the entrypoint copies users.xml
+      # there to diff it), and every write lands under /var/lib/clickhouse.
+      hardened: true
+      # The image's own `clickhouse` user. Running as it means the entrypoint
+      # skips its chown branch, which would fail without capabilities.
+      runAsUser: 101
+      runAsGroup: 101
+      computePlan: "[%compute_plan%]"
+      minComputePlan: medium
+      containers:
+        - name: clickhouse
+          image: docker.io/clickhouse/clickhouse-server
+          tag: "[%version%]"
+          # The image's ENTRYPOINT, declared because the password arrives
+          # through the secret-exec shim, and the shim can only wrap an
+          # entrypoint it has been told about. Without this the password env
+          # var is never set, and `from_env` resolves to an empty password.
+          command: [/entrypoint.sh]
+          env:
+            - name: CLICKHOUSE_PASSWORD
+              secretRef: { vault: "[%instance_vault%]", key: password }
+            # See the header, point 1. users.d/stackship-users.xml below is
+            # what defines the user instead.
+            - name: CLICKHOUSE_SKIP_USER_SETUP
+              value: "1"
+            - name: CLICKHOUSE_DB
+              value: "[%database%]"
+          ports:
+            - name: http
+              port: 8123
+            - name: native
+              port: 9000
+          probes:
+            # /ping is unauthenticated and answers "Ok." once the server is
+            # listening, so no credential needs to appear in the pod spec.
+            readiness:
+              type: http
+              port: http
+              path: /ping
+              initialDelaySeconds: 5
+              periodSeconds: 10
+              timeoutSeconds: 5
+              failureThreshold: 3
+            # Startup loads every table's metadata before it listens, which on
+            # a large database takes a while. This allows five minutes before
+            # the pod counts as failed.
+            startup:
+              type: http
+              port: http
+              path: /ping
+              initialDelaySeconds: 5
+              periodSeconds: 5
+              failureThreshold: 60
+            liveness:
+              type: http
+              port: http
+              path: /ping
+              periodSeconds: 20
+              timeoutSeconds: 5
+              failureThreshold: 3
+          mounts:
+            - volume: data
+              path: /var/lib/clickhouse
+            # Each file is mounted on its own with subPath, so it sits beside
+            # the image's files. Mounting over config.d as a whole would hide
+            # docker_related_config.xml, which is what makes ClickHouse listen
+            # on all interfaces rather than on localhost only.
+            - volume: config
+              path: /etc/clickhouse-server/config.d/stackship.xml
+              subPath: stackship.xml
+              readOnly: true
+            - volume: config
+              path: /etc/clickhouse-server/users.d/stackship-users.xml
+              subPath: stackship-users.xml
+              readOnly: true
+
+      volumes:
+        - name: data
+          persistent:
+            size: "[%storage_size%]"
+            tier: standard
+            # A fresh volume arrives root-owned. fsGroup is what lets uid 101
+            # write to it. Verified against a root-owned, group-writable mount.
+            fsGroup: 101
+        - name: config
+          files:
+            content:
+              # Merged over the image's config.xml. Unlike the stock image,
+              # logs go to stderr only, and every system log table gets a TTL.
+              # Without one these tables have no limit: trace_log, metric_log
+              # and text_log (which logs at trace level by default) fill the
+              # volume at a rate set by the load, not by the data.
+              stackship.xml: |
+                <clickhouse>
+                  <logger>
+                    <level>information</level>
+                    <console>1</console>
+                    <log remove="remove"/>
+                    <errorlog remove="remove"/>
+                  </logger>
+                  <text_log>
+                    <level>information</level>
+                    <ttl>event_date + INTERVAL 7 DAY DELETE</ttl>
+                  </text_log>
+                  <trace_log><ttl>event_date + INTERVAL 7 DAY DELETE</ttl></trace_log>
+                  <metric_log><ttl>event_date + INTERVAL 7 DAY DELETE</ttl></metric_log>
+                  <asynchronous_metric_log><ttl>event_date + INTERVAL 7 DAY DELETE</ttl></asynchronous_metric_log>
+                  <query_metric_log><ttl>event_date + INTERVAL 7 DAY DELETE</ttl></query_metric_log>
+                  <background_schedule_pool_log><ttl>event_date + INTERVAL 7 DAY DELETE</ttl></background_schedule_pool_log>
+                  <part_log><ttl>event_date + INTERVAL 30 DAY DELETE</ttl></part_log>
+                  <error_log><ttl>event_date + INTERVAL 30 DAY DELETE</ttl></error_log>
+                </clickhouse>
+              # Replaces the stock `default` user, which is passwordless and
+              # restricted to localhost, with one that takes its password from
+              # the environment and may connect from anywhere. access_management
+              # lets it create further users with SQL. Those users are stored on
+              # the data volume, not in this file.
+              stackship-users.xml: |
+                <clickhouse>
+                  <users>
+                    <default>
+                      <password from_env="CLICKHOUSE_PASSWORD"/>
+                      <networks><ip>::/0</ip></networks>
+                      <profile>default</profile>
+                      <quota>default</quota>
+                      <access_management>1</access_management>
+                      <named_collection_control>1</named_collection_control>
+                    </default>
+                  </users>
+                </clickhouse>
+
+  endpoints:
+    # The HTTP interface over TLS. Not auth-guarded: ClickHouse authenticates
+    # every request itself with basic auth, and a guard in front would block
+    # the drivers and BI tools this endpoint exists for.
+    - name: web
+      condition: expose_http
+      component: clickhouse
+      port: http
+      expose: ingress
+      hostname: "[%ingress_host%]"
+      issuer: "[%ingress_certificate_issuer%]"
+    # The native protocol is not HTTP, so an ingress cannot route it. This is
+    # a LoadBalancer, with no TLS in front of it.
+    - name: native
+      condition: expose_native
+      component: clickhouse
+      port: native
+      expose: loadBalancer
