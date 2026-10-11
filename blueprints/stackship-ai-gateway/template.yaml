@@ -1,0 +1,283 @@
+apiVersion: blueprints.stackship.se/v2
+kind: BlueprintTemplate
+
+# The Stackship AI gateway: one Go binary serving the OpenAI-compatible API at
+# /v1, the management UI at / and its API at /api, on one hostname. Delivered
+# the way the Data Hub is: a container instance with a platform-managed
+# PostgreSQL.
+#
+# It ships at one replica. Rate limits are counted in the process, so a second
+# replica doubles every key's effective limit; budgets, sessions and the log are
+# in PostgreSQL and replica-safe. Raise replicas in the component sheet only
+# with that in mind.
+
+metadata:
+  slug: stackship-ai-gateway
+  title: Stackship AI Gateway
+  description: >-
+    An OpenAI-compatible gateway in front of your model providers: virtual keys
+    per service or person, AI profiles that decide what may be sent where,
+    budgets and rate limits, and a live request log that stores no prompt
+    content.
+  version: "0.1.0"
+  category: AI
+  tags: [stackship, ai, llm, gateway, proxy, openai, anthropic, postgres, budgets]
+  documentation: https://gitlab.stackship.dev/stacked-ip/aiproxy/-/blob/main/README.md
+
+parameters:
+  - name: image_tag
+    type: String
+    label: Image Tag
+    description: >-
+      Tag of registry.stackship.se/aiproxy/aiproxy. Pin a version for a
+      production installation so a redeploy cannot silently move it.
+    default: "0.1.0"
+
+  - name: compute_plan
+    type: Select
+    label: Compute Plan
+    description: >-
+      Memory grows with concurrent streams, not with traffic volume. Small fits
+      an internal gateway; pick medium for hundreds of parallel streams.
+    options: ["small", "medium", "large"]
+    default: "small"
+
+  - name: db_availability
+    type: Select
+    label: Database
+    description: >-
+      A Stackship-managed PostgreSQL, with backups and the platform's own
+      upgrade path. High availability runs three instances.
+    options: ["Single Instance", "High Available"]
+    default: "Single Instance"
+
+  - name: db_storage_size
+    type: Select
+    label: Database Storage
+    description: >-
+      Keys, profiles and settings are tiny; what grows is the request log, one
+      row per call, kept for the retention period.
+    options: ["5Gi", "10Gi", "20Gi", "50Gi"]
+    default: "10Gi"
+
+  # Both keys are base64-decoded by the gateway and must be exactly 32 bytes.
+  # generateLength counts bytes on the base64 path.
+  - name: secrets_key
+    type: Secret
+    label: Secrets Encryption Key
+    description: >-
+      Encrypts the provider API keys stored in the database. Losing it strands
+      every stored provider key; it is generated once and left alone.
+    generate: true
+    generateSpec: base64
+    generateLength: 32
+    advanced: true
+
+  - name: session_key
+    type: Secret
+    label: Session Signing Key
+    generate: true
+    generateSpec: base64
+    generateLength: 32
+    advanced: true
+
+  - name: admin_username
+    type: String
+    label: Admin Username
+    description: The built-in administrator for first sign-in and installations without OIDC.
+    default: "admin"
+
+  - name: admin_password
+    type: Secret
+    label: Admin Password
+    description: Generated; read it from the instance vault.
+    generate: true
+    generateLength: 24
+
+  - name: oidc_authority
+    type: String
+    label: OIDC Authority
+    description: >-
+      The issuer URL, e.g. https://auth.example.se/realms/stackship. Sign-in with
+      OIDC is on when the authority, client ID and client secret are all set.
+    default: ""
+    advanced: true
+
+  - name: oidc_client_id
+    type: String
+    label: OIDC Client ID
+    default: ""
+    advanced: true
+
+  - name: oidc_client_secret
+    type: Secret
+    label: OIDC Client Secret
+    default: ""
+    advanced: true
+
+  - name: oidc_display_name
+    type: String
+    label: OIDC Button Label
+    default: "Stackship"
+    advanced: true
+
+  - name: oidc_admin_claim
+    type: String
+    label: OIDC Admin Claim
+    description: Dotted path of the claim holding roles or groups.
+    default: "realm_access.roles"
+    advanced: true
+
+  - name: oidc_admin_values
+    type: String
+    label: OIDC Admin Values
+    description: Comma-separated values of that claim that grant the admin role.
+    default: "aiproxy-admin"
+    advanced: true
+
+  - name: retention_days
+    type: Select
+    label: Request Log Retention (days)
+    description: Request-log rows older than this are deleted. Daily usage totals are kept.
+    options: ["30", "90", "180", "365"]
+    default: "90"
+
+  - name: log_level
+    type: Select
+    label: Log Level
+    options: ["info", "debug", "warn", "error"]
+    default: "info"
+    advanced: true
+
+  - name: ingress_host
+    type: String
+    label: Public Hostname
+    description: >-
+      Every client's base URL points here, so moving it later means editing
+      every caller. Choose the name you intend to keep.
+    default: "[%name%].{{domain_suffix}}"
+
+  - name: ingress_certificate_issuer
+    type: String
+    label: Certificate Issuer
+    default: "{{cert_issuer}}"
+    advanced: true
+
+outputs:
+  - name: api_base_url
+    label: API Base URL
+    description: Point an OpenAI-compatible client's base URL here.
+    type: Url
+    value: "https://[%ingress_host%]/v1"
+  - name: admin_ui_url
+    label: Admin Console
+    description: Gateways, keys, profiles, budgets and the live usage dashboard
+    type: Url
+    value: "https://[%ingress_host%]/"
+  - name: admin_username
+    label: Admin Username
+    description: Its password is in the instance vault
+    type: String
+    value: "[%admin_username%]"
+
+# The database, provisioned by the platform rather than run as a container.
+# The platform waits for it to accept connections before creating the
+# instance, and writes the libpq URI into the vault.
+resources:
+  - name: db
+    type: postgres
+    availability: "[%db_availability%]"
+    storage: "[%db_storage_size%]"
+    exposes:
+      - output: uri
+        vaultKey: database_url
+
+instance:
+  components:
+    - name: gateway
+      startupOrder: 1
+      replicas: 1
+      # The binary writes nothing to disk, so the read-only root filesystem
+      # costs nothing.
+      hardened: true
+      runAsUser: 65532
+      computePlan: "[%compute_plan%]"
+      containers:
+        - name: gateway
+          image: registry.stackship.se/aiproxy/aiproxy
+          tag: "[%image_tag%]"
+          # The image's entrypoint, declared so the secret-exec shim can wrap
+          # it: Kubernetes cannot prepend to an entrypoint, and without this
+          # every vault-backed variable below is resolved and then dropped.
+          command: [/aiproxy]
+          ports:
+            - name: http
+              port: 8080
+          env:
+            - name: AIPROXY_PUBLIC_URL
+              value: "https://[%ingress_host%]"
+            - name: AIPROXY_TRUST_PROXY_HEADERS
+              value: "true"
+            - name: AIPROXY_DATABASE_URL
+              secretRef: { vault: "[%instance_vault%]", key: database_url }
+            - name: AIPROXY_SECRETS_KEY
+              secretRef: { vault: "[%instance_vault%]", key: secrets_key }
+            - name: AIPROXY_SESSION_KEY
+              secretRef: { vault: "[%instance_vault%]", key: session_key }
+            - name: AIPROXY_ADMIN_USERNAME
+              value: "[%admin_username%]"
+            - name: AIPROXY_ADMIN_PASSWORD
+              secretRef: { vault: "[%instance_vault%]", key: admin_password }
+            - name: AIPROXY_OIDC_AUTHORITY
+              value: "[%oidc_authority%]"
+            - name: AIPROXY_OIDC_CLIENT_ID
+              value: "[%oidc_client_id%]"
+            - name: AIPROXY_OIDC_CLIENT_SECRET
+              secretRef: { vault: "[%instance_vault%]", key: oidc_client_secret }
+            - name: AIPROXY_OIDC_DISPLAY_NAME
+              value: "[%oidc_display_name%]"
+            - name: AIPROXY_OIDC_ADMIN_CLAIM
+              value: "[%oidc_admin_claim%]"
+            - name: AIPROXY_OIDC_ADMIN_VALUES
+              value: "[%oidc_admin_values%]"
+            - name: AIPROXY_LOG_RETENTION_DAYS
+              value: "[%retention_days%]"
+            - name: AIPROXY_LOG_LEVEL
+              value: "[%log_level%]"
+          probes:
+            # Liveness, not readiness, gates startup: readiness waits for the
+            # migrations, and five minutes covers a cold node and a fresh database.
+            startup:
+              type: http
+              port: http
+              path: /health/liveness
+              initialDelaySeconds: 2
+              periodSeconds: 5
+              failureThreshold: 60
+            # Reports the database: a pod that loses it stops receiving traffic.
+            readiness:
+              type: http
+              port: http
+              path: /health/readiness
+              periodSeconds: 10
+              timeoutSeconds: 5
+              failureThreshold: 3
+            # Never the database: an outage should not restart the pod in a loop.
+            liveness:
+              type: http
+              port: http
+              path: /health/liveness
+              periodSeconds: 20
+              timeoutSeconds: 5
+              failureThreshold: 3
+
+  endpoints:
+    # One hostname for everything. Not authGuard-ed: /v1 clients send a bearer
+    # key and cannot complete an interactive sign-in; /api is gated by the
+    # gateway's own sessions.
+    - name: web
+      component: gateway
+      port: http
+      expose: ingress
+      hostname: "[%ingress_host%]"
+      issuer: "[%ingress_certificate_issuer%]"
