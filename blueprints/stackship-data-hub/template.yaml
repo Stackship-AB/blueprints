@@ -12,7 +12,7 @@ metadata:
   description: >-
     Collect data from databases, APIs and files, transform it on the way in,
     build views visually, and publish them as versioned REST endpoints.
-  version: "2.2"
+  version: "2.3"
   category: Platforms
   tags: [stackship, data, etl, ingestion, analytics, postgres, api]
   documentation: https://gitlab.stackship.se/stackship-apps/data-lake/-/blob/main/DRIFT.md
@@ -277,7 +277,9 @@ instance:
       port: http
       expose: ingress
       hostname: "[%ingress_host%]"
-      paths: ["/api", "/datalager", "/signin-oidc", "/health"]
+      # /mcp is the MCP server AI clients connect to. Left out, the ingress
+      # sends the client's POST to the web image, whose nginx answers 405.
+      paths: ["/api", "/datalager", "/mcp", "/signin-oidc", "/health"]
       issuer: "[%ingress_certificate_issuer%]"
 
     - name: web
