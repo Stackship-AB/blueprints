@@ -19,7 +19,7 @@ metadata:
     per service or person, AI profiles that decide what may be sent where,
     budgets and rate limits, and a live request log that stores no prompt
     content.
-  version: "0.3.0"
+  version: "latest"
   category: AI
   tags: [stackship, ai, llm, gateway, proxy, openai, anthropic, postgres, budgets]
   documentation: https://gitlab.stackship.dev/stacked-ip/aiproxy/-/blob/main/README.md
@@ -31,7 +31,7 @@ parameters:
     description: >-
       Tag of registry.stackship.se/aiproxy/aiproxy. Pin a version for a
       production installation so a redeploy cannot silently move it.
-    default: "0.3.0"
+    default: "latest"
 
   - name: compute_plan
     type: Select
