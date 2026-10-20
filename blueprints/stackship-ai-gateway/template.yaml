@@ -200,7 +200,6 @@ instance:
       # The binary writes nothing to disk, so the read-only root filesystem
       # costs nothing.
       hardened: true
-      runAsUser: 65532
       computePlan: "[%compute_plan%]"
       containers:
         - name: gateway
