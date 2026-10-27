@@ -25,7 +25,7 @@ metadata:
     Self-hosted Supabase — open source Firebase alternative with PostgreSQL
     database, authentication, instant APIs, realtime subscriptions, storage, and
     Studio dashboard.
-  version: "3.2"
+  version: "3.3"
   category: Databases
   tags: [supabase, database, auth, storage, realtime, api, postgres]
   documentation: https://supabase.com/docs/guides/self-hosting
@@ -491,7 +491,7 @@ instance:
       containers:
         - name: storage
           image: registry.stackship.se/blueprints/supabase/storage-api
-          tag: "v1.48.26"
+          tag: "v1.84.28"
           # The image's own ENTRYPOINT and CMD, declared so the operator can wrap
           # them: a container with a vault-backed variable runs through the
           # secret-exec shim, and Kubernetes has no way to PREPEND to an
@@ -569,7 +569,7 @@ instance:
       containers:
         - name: meta
           image: registry.stackship.se/blueprints/supabase/postgres-meta
-          tag: "v0.96.3"
+          tag: "v0.100.0"
           # The image's own ENTRYPOINT and CMD, declared so the operator can wrap
           # them: a container with a vault-backed variable runs through the
           # secret-exec shim, and Kubernetes has no way to PREPEND to an
@@ -1085,7 +1085,7 @@ instance:
       containers:
         - name: studio
           image: registry.stackship.se/blueprints/supabase/studio
-          tag: "2026.04.08-sha-205cbe7"
+          tag: "2026.10.26-sha-478bd88"
           # The image's own ENTRYPOINT and CMD, declared so the operator can wrap
           # them: a container with a vault-backed variable runs through the
           # secret-exec shim, and Kubernetes has no way to PREPEND to an
