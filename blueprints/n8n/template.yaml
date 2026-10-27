@@ -1,8 +1,9 @@
 apiVersion: blueprints.stackship.se/v2
 kind: BlueprintTemplate
 
-# n8n from the project's own image, docker.io/n8nio/n8n. Facts read off the
-# image and off running it, in the order they shape the file:
+# n8n from the project's own image, docker.io/n8nio/n8n, served from the
+# Stackship registry mirror (see mirror-images.sh). Facts read off the image and
+# off running it, in the order they shape the file:
 #
 #   - ENTRYPOINT is ["tini", "--", "/docker-entrypoint.sh"] and there is NO CMD.
 #     That script execs `n8n` with no arguments when it is given none, so the
@@ -79,7 +80,7 @@ metadata:
     gaps where a node does not exist. Self-hosted, so the credentials and the
     data stay in your own cluster — with a Stackship-managed PostgreSQL behind
     it.
-  version: "2.42.6"
+  version: "2.45.4"
   category: Platforms
   tags: [n8n, automation, workflow, integration, webhooks, low-code, ai]
   documentation: https://docs.n8n.io/hosting/
@@ -89,13 +90,11 @@ parameters:
     type: Select
     label: n8n Version
     description: >-
-      Tag on docker.io/n8nio/n8n. n8n ships several releases a week, so pin an
-      exact version for anything you depend on. "stable" is the floating tag
-      upstream moves to each stable release — convenient, and note that it will
-      carry you across a MAJOR version without asking, which for n8n means
-      breaking changes in both workflows and configuration.
-    options: ["2.42.6", "stable"]
-    default: "2.42.6"
+      Tag of docker.io/n8nio/n8n, mirrored into the Stackship registry. Only
+      exact versions are offered: a mirrored floating tag such as "stable" would
+      move only when the mirror is re-run, so it could not follow upstream.
+    options: ["2.45.4"]
+    default: "2.45.4"
     documentation: https://github.com/n8n-io/n8n/releases
 
   - name: compute_plan
@@ -297,7 +296,7 @@ instance:
       computePlan: "[%compute_plan%]"
       containers:
         - name: n8n
-          image: docker.io/n8nio/n8n
+          image: registry.stackship.se/blueprints/n8n/n8n
           tag: "[%version%]"
           # The image's ENTRYPOINT, with tini spelled absolutely rather than as
           # the bare `tini` the image uses — this argv is handed to the
