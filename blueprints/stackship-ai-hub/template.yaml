@@ -197,6 +197,11 @@ instance:
       # The binary writes nothing to disk, so the read-only root filesystem
       # costs nothing.
       hardened: true
+      # Required by hardened: it sets runAsNonRoot on the pod, and the
+      # platform's secret-init and secret-exec init containers come from images
+      # that run as root. Without a uid here the kubelet refuses to start them
+      # and the pod never leaves Init. 65532 is the image's own nonroot user.
+      runAsUser: 65532
       computePlan: "[%compute_plan%]"
       containers:
         - name: gateway
