@@ -12,17 +12,14 @@ kind: BlueprintTemplate
 # with that in mind.
 
 metadata:
-  slug: stackship-ai-gateway
-  title: Stackship AI Gateway
+  slug: stackship-ai-hub
+  title: Stackship AI Hub
   description: >-
-    An OpenAI-compatible gateway in front of your model providers: virtual keys
-    per service or person, AI profiles that decide what may be sent where,
-    budgets and rate limits, and a live request log that stores no prompt
-    content.
+    Your organisation’s own AI gateway: every AI call goes through a single point that you run and control.
   version: "latest"
   category: AI
-  tags: [stackship, ai, llm, gateway, proxy, openai, anthropic, postgres, budgets]
-  documentation: https://gitlab.stackship.dev/stacked-ip/aiproxy/-/blob/main/README.md
+  tags: [stackship, ai, llm, gateway, proxy]
+  documentation:
 
 parameters:
   - name: image_tag

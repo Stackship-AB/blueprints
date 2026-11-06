@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <defs><linearGradient id="stackship-ai-hub-g" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#0085B8"/><stop offset="1" stop-color="#00C28E"/></linearGradient></defs>
+  <rect width="256" height="256" rx="58.88" fill="url(#stackship-ai-hub-g)"/>
+  <g transform="translate(58.88 58.88) scale(5.76)" fill="none" stroke="#FFFFFF" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+    <circle cx="4" cy="4.5" r="1.75"/>
+    <circle cx="12" cy="4.5" r="1.75"/>
+    <circle cx="20" cy="4.5" r="1.75"/>
+    <path d="M12 6.25V13M4 6.25V8.5a1.5 1.5 0 0 0 1.5 1.5h2.5a1.5 1.5 0 0 1 1.5 1.5V13M20 6.25V8.5a1.5 1.5 0 0 1-1.5 1.5H16a1.5 1.5 0 0 0-1.5 1.5V13" stroke-width="1.05"/>
+    <rect x="6.5" y="13" width="11" height="7" rx="0.75"/>
+    <path d="M9.25 15v3M12 15v3M14.75 15v3" stroke-width="1.05"/>
+  </g>
+</svg>
