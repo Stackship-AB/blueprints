@@ -12,32 +12,34 @@ kind: BlueprintTemplate
 #     derived connection strings live in the instance's Stackship Secrets vault
 #     and are referenced with env[].secretRef, so no secret is ever written into
 #     the CR where a containerinstance/read holder could see it.
-#   - Component `postgresql` is named `postgres`, because the ClusterIP Service
-#     is {instance}-{component} and every other component addresses it as
-#     `[%name%]-postgres`. Renaming it would have silently broken that wiring.
 #   - The two Ingress documents become two endpoints sharing one hostname: the
 #     API paths on the gateway, `/` on studio, and only studio is auth-guarded.
+#
+# Since 4.0 the database is a platform PostgreSQL server and database, chosen or
+# created in the deploy wizard, instead of a bundled container. Supabase's roles
+# are the database's own roles (resources.db.roles), named <owner>_<role> on the
+# server so two instances can share one; every service is told those names, and
+# the anon and service-role keys carry them. The `setup` component creates the
+# schemas and grants Supabase's services expect, as the database owner, before
+# any of them start. Features that need extensions the platform image does not
+# ship (pg_graphql, pg_net, pgsodium, pg_cron) are not available, and neither
+# is Realtime: its migrations name the anon/authenticated/service_role roles
+# literally and set a superuser-only parameter, so it cannot run on a platform
+# server without a superuser (blueprint-database-binding spec §8).
 
 metadata:
   slug: supabase
   title: Supabase
   description: >-
     Self-hosted Supabase — open source Firebase alternative with PostgreSQL
-    database, authentication, instant APIs, realtime subscriptions, storage, and
+    database, authentication, instant APIs, storage, and
     Studio dashboard.
-  version: "3.3"
+  version: "4.0"
   category: Databases
-  tags: [supabase, database, auth, storage, realtime, api, postgres]
+  tags: [supabase, database, auth, storage, api, postgres]
   documentation: https://supabase.com/docs/guides/self-hosting
 
 parameters:
-  - name: db_password
-    type: Secret
-    label: Database Password
-    description: Password for the PostgreSQL superuser. Auto-generated.
-    generate: true
-    generateLength: 32
-
   - name: jwt_secret
     type: Secret
     label: JWT Secret
@@ -52,7 +54,9 @@ parameters:
     generate: true
     generateSpec: jwt
     generateClaims:
-      role: anon
+      # The database's own anon role, which exists once the database does: the
+      # key is generated after provisioning.
+      role: "[%resources.db.role.anon.username%]"
       iss: supabase
 
   - name: service_role_key
@@ -64,7 +68,7 @@ parameters:
     generate: true
     generateSpec: jwt
     generateClaims:
-      role: service_role
+      role: "[%resources.db.role.service_role.username%]"
       iss: supabase
 
   - name: pg_meta_crypto_key
@@ -73,50 +77,6 @@ parameters:
     description: 32-byte key pg-meta uses to encrypt foreign-data-wrapper credentials.
     generate: true
     generateLength: 32
-
-  # Derived secrets. Generation alone is not enough: each of these composes the
-  # password with the postgres service name, and each is as sensitive as the
-  # password itself — so they go to the vault, not into the document. The
-  # _urlencoded twin is what keeps a password containing URI-reserved characters
-  # from producing a connection string that parses wrong.
-  - name: db_url
-    type: Secret
-    label: Postgres URL (superuser)
-    derived: "postgresql://postgres:[%db_password_urlencoded%]@[%name%]-postgres:5432/postgres"
-
-  - name: db_url_auth
-    type: Secret
-    label: Postgres URL (auth)
-    derived: "postgresql://supabase_auth_admin:[%db_password_urlencoded%]@[%name%]-postgres:5432/postgres"
-
-  - name: db_url_rest
-    type: Secret
-    label: Postgres URL (rest)
-    derived: "postgresql://authenticator:[%db_password_urlencoded%]@[%name%]-postgres:5432/postgres"
-
-  - name: db_url_realtime
-    type: Secret
-    label: Postgres URL (realtime)
-    derived: "postgresql://supabase_admin:[%db_password_urlencoded%]@[%name%]-postgres:5432/postgres"
-
-  - name: db_url_storage
-    type: Secret
-    label: Postgres URL (storage)
-    derived: "postgresql://supabase_storage_admin:[%db_password_urlencoded%]@[%name%]-postgres:5432/postgres"
-
-  - name: storage_size
-    type: Select
-    label: Database Storage
-    description: Persistent volume size for PostgreSQL data
-    options: ["5Gi", "10Gi", "20Gi", "50Gi", "100Gi"]
-    default: "10Gi"
-
-  - name: postgres_version
-    type: Select
-    label: PostgreSQL Version
-    description: Supabase PostgreSQL image tag with pre-loaded extensions
-    options: ["17.6.1.084"]
-    default: "17.6.1.084"
 
   - name: ingress_host
     type: String
@@ -141,122 +101,121 @@ outputs:
     value: "https://[%ingress_host%]/"
   - name: api_url
     label: API URL
-    description: Public REST / Realtime / Auth / Storage gateway
+    description: Public REST / Auth / Storage gateway
     type: Url
     value: "https://[%ingress_host%]/"
 
+resources:
+  - name: db
+    type: postgres
+    title: Supabase database
+    databaseName: "[%name%]"
+    storage: 10Gi
+    roles:
+      - { name: anon }
+      - { name: authenticated }
+      - { name: service_role, bypassRls: true }
+      - { name: authenticator, login: true, memberOf: [anon, authenticated, service_role] }
+      - { name: auth_admin, login: true }
+      - { name: storage_admin, login: true, memberOf: [anon, authenticated, service_role] }
+    exposes:
+      - { output: uri, vaultKey: db_url }
+      - { output: host, vaultKey: db_host }
+      - { output: port, vaultKey: db_port }
+      - { output: database, vaultKey: db_name }
+      - { output: username, vaultKey: db_owner }
+      - { output: password, vaultKey: db_owner_password }
+      - { output: role.authenticator.uri, vaultKey: db_url_rest }
+      - { output: role.auth_admin.uri, vaultKey: db_url_auth }
+      - { output: role.storage_admin.uri, vaultKey: db_url_storage }
+      - { output: role.anon.username, vaultKey: db_role_anon }
+      - { output: role.authenticated.username, vaultKey: db_role_authenticated }
+      - { output: role.service_role.username, vaultKey: db_role_service }
+      - { output: role.auth_admin.username, vaultKey: db_role_auth_admin }
+      - { output: role.storage_admin.username, vaultKey: db_role_storage_admin }
+
 instance:
   components:
-    - name: postgres
+    # Prepares the database for Supabase's services, as its owner: the schemas
+    # they migrate into, owned by the role each connects as, the grants between
+    # them. Idempotent, and serialised with an
+    # advisory lock, so a restart re-runs it harmlessly. Startup order 1, so
+    # every service starts against a prepared database.
+    - name: setup
       startupOrder: 1
       replicas: 1
-      # The image runs rootless as uid 100; tenant policy forbids the root init
-      # container that chowning the data dir would otherwise need, so the
-      # entrypoint's own mkdir + initdb create it — which only works because the
-      # pod runs as that uid with a matching fsGroup.
-      runAsUser: 100
-      runAsGroup: 101
-      computePlan: medium
-      minComputePlan: medium
-      cpu: 250m
-      memory: 1Gi
-      containers:
-        - name: postgres
-          image: registry.stackship.se/blueprints/supabase/postgres
-          tag: "[%postgres_version%]"
-          # The image's own ENTRYPOINT and CMD, declared so the operator can wrap
-          # them: a container with a vault-backed variable runs through the
-          # secret-exec shim, and Kubernetes has no way to PREPEND to an
-          # entrypoint — setting command replaces it. Without this the secret is
-          # resolved and then dropped, which is how postgres reported its password
-          # unset moments after secret-init reported resolving it.
+      computePlan: nano
+      initContainers:
+        - name: prepare
+          image: postgres
+          tag: "17-alpine"
           command:
-            - docker-entrypoint.sh
-          args:
-            - postgres
-            - -D
-            - /etc/postgresql
-          ports:
-            - name: postgres
-              port: 5432
+            - sh
+            - -c
+            - >-
+              psql "$DB_URL" -v ON_ERROR_STOP=1
+              -v owner="$DB_OWNER" -v database="$DB_NAME"
+              -v anon="$ROLE_ANON" -v authenticated="$ROLE_AUTHENTICATED" -v service_role="$ROLE_SERVICE"
+              -v auth_admin="$ROLE_AUTH_ADMIN" -v storage_admin="$ROLE_STORAGE_ADMIN"
+              -f /setup/setup.sql
           env:
-            - name: POSTGRES_PASSWORD
-              secretRef: { vault: "[%instance_vault%]", key: db_password }
-            - name: POSTGRES_DB
-              value: "postgres"
-            - name: JWT_SECRET
-              secretRef: { vault: "[%instance_vault%]", key: jwt_secret }
-            - name: JWT_EXP
-              value: "3600"
-          probes:
-            # exec, not tcp: the socket accepts while initdb is still running, so
-            # a TCP probe reads ready and the next startup wave would launch
-            # every downstream service against an uninitialised database.
-            readiness:
-              type: exec
-              command: [pg_isready, -U, postgres, -h, localhost]
-              initialDelaySeconds: 10
-              periodSeconds: 10
-              failureThreshold: 6
-            liveness:
-              type: exec
-              command: [pg_isready, -U, postgres, -h, localhost]
-              initialDelaySeconds: 30
-              periodSeconds: 20
-              failureThreshold: 3
+            - name: DB_URL
+              secretRef: { vault: "[%instance_vault%]", key: db_url }
+            - name: DB_OWNER
+              secretRef: { vault: "[%instance_vault%]", key: db_owner }
+            - name: DB_NAME
+              secretRef: { vault: "[%instance_vault%]", key: db_name }
+            - name: ROLE_ANON
+              secretRef: { vault: "[%instance_vault%]", key: db_role_anon }
+            - name: ROLE_AUTHENTICATED
+              secretRef: { vault: "[%instance_vault%]", key: db_role_authenticated }
+            - name: ROLE_SERVICE
+              secretRef: { vault: "[%instance_vault%]", key: db_role_service }
+            - name: ROLE_AUTH_ADMIN
+              secretRef: { vault: "[%instance_vault%]", key: db_role_auth_admin }
+            - name: ROLE_STORAGE_ADMIN
+              secretRef: { vault: "[%instance_vault%]", key: db_role_storage_admin }
           mounts:
-            # Mounted at the postgres HOME, not at the data dir: initdb needs to
-            # create the data dir itself with mode 0700, and lost+found sitting
-            # at the parent keeps the data dir clean on first boot.
-            - volume: data
-              path: /var/lib/postgresql
-            # Each init script is subPath-mounted so it slots BESIDE the image's
-            # own numbered files rather than hiding the directory. The 99- prefix
-            # orders them after the image's own init.
-            - volume: init
-              path: /docker-entrypoint-initdb.d/init-scripts/99-roles.sql
-              subPath: 99-roles.sql
+            - volume: setup
+              path: /setup
               readOnly: true
-            - volume: init
-              path: /docker-entrypoint-initdb.d/init-scripts/99-jwt.sql
-              subPath: 99-jwt.sql
-              readOnly: true
-            - volume: init
-              path: /docker-entrypoint-initdb.d/migrations/99-realtime.sql
-              subPath: 99-realtime.sql
-              readOnly: true
+      containers:
+        - name: idle
+          image: busybox
+          tag: "1.36"
+          command: [sleep, infinity]
       volumes:
-        - name: data
-          persistent:
-            size: "[%storage_size%]"
-            tier: standard
-            fsGroup: 101
-        - name: init
+        - name: setup
           files:
             content:
-              # Vendored from supabase/supabase docker/volumes/db. The image
-              # creates the supabase_* roles but does NOT seed their passwords,
-              # set the JWT database parameters, or create the _realtime schema —
-              # without these three files every downstream service fails auth on
-              # first connect.
-              99-roles.sql: |
-                \set pgpass `echo "$POSTGRES_PASSWORD"`
+              setup.sql: |
+                SELECT pg_advisory_lock(hashtext('stackship-supabase-setup'));
 
-                ALTER USER authenticator WITH PASSWORD :'pgpass';
-                ALTER USER pgbouncer WITH PASSWORD :'pgpass';
-                ALTER USER supabase_auth_admin WITH PASSWORD :'pgpass';
-                ALTER USER supabase_storage_admin WITH PASSWORD :'pgpass';
-              99-jwt.sql: |
-                \set jwt_secret `echo "$JWT_SECRET"`
-                \set jwt_exp `echo "$JWT_EXP"`
+                CREATE SCHEMA IF NOT EXISTS extensions;
+                CREATE EXTENSION IF NOT EXISTS "uuid-ossp" WITH SCHEMA extensions;
+                CREATE EXTENSION IF NOT EXISTS pgcrypto WITH SCHEMA extensions;
+                GRANT USAGE ON SCHEMA extensions TO :"anon", :"authenticated", :"service_role", :"auth_admin", :"storage_admin";
 
-                ALTER DATABASE postgres SET "app.settings.jwt_secret" TO :'jwt_secret';
-                ALTER DATABASE postgres SET "app.settings.jwt_exp" TO :'jwt_exp';
-              99-realtime.sql: |
-                \set pguser `echo "$POSTGRES_USER"`
+                GRANT USAGE ON SCHEMA public TO :"anon", :"authenticated", :"service_role";
+                ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO :"anon", :"authenticated", :"service_role";
+                ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO :"anon", :"authenticated", :"service_role";
+                ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON FUNCTIONS TO :"anon", :"authenticated", :"service_role";
 
-                create schema if not exists _realtime;
-                alter schema _realtime owner to :pguser;
+                GRANT CREATE ON DATABASE :"database" TO :"auth_admin", :"storage_admin";
+                CREATE SCHEMA IF NOT EXISTS auth AUTHORIZATION :"auth_admin";
+                CREATE SCHEMA IF NOT EXISTS storage AUTHORIZATION :"storage_admin";
+
+                SET ROLE :"auth_admin";
+                GRANT USAGE ON SCHEMA auth TO :"anon", :"authenticated", :"service_role", :"owner";
+                ALTER ROLE :"auth_admin" SET search_path = auth;
+                RESET ROLE;
+
+                SET ROLE :"storage_admin";
+                GRANT USAGE ON SCHEMA storage TO :"anon", :"authenticated", :"service_role", :"owner";
+                ALTER ROLE :"storage_admin" SET search_path = storage;
+                RESET ROLE;
+
+                SELECT pg_advisory_unlock(hashtext('stackship-supabase-setup'));
     - name: auth
       startupOrder: 2
       computePlan: small
@@ -297,10 +256,12 @@ instance:
               secretRef: { vault: "[%instance_vault%]", key: jwt_secret }
             - name: GOTRUE_JWT_EXP
               value: "3600"
+            - name: GOTRUE_DB_NAMESPACE
+              value: "auth"
             - name: GOTRUE_JWT_DEFAULT_GROUP_NAME
-              value: "authenticated"
+              secretRef: { vault: "[%instance_vault%]", key: db_role_authenticated }
             - name: GOTRUE_JWT_ADMIN_ROLES
-              value: "service_role"
+              secretRef: { vault: "[%instance_vault%]", key: db_role_service }
             - name: GOTRUE_JWT_AUD
               value: "authenticated"
             - name: GOTRUE_JWT_ISSUER
@@ -349,9 +310,9 @@ instance:
             - name: PGRST_DB_URI
               secretRef: { vault: "[%instance_vault%]", key: db_url_rest }
             - name: PGRST_DB_SCHEMAS
-              value: "public,storage,graphql_public"
+              value: "public,storage"
             - name: PGRST_DB_ANON_ROLE
-              value: "anon"
+              secretRef: { vault: "[%instance_vault%]", key: db_role_anon }
             - name: PGRST_JWT_SECRET
               secretRef: { vault: "[%instance_vault%]", key: jwt_secret }
             - name: PGRST_DB_USE_LEGACY_GUCS
@@ -373,115 +334,6 @@ instance:
               port: http
               path: /
               initialDelaySeconds: 15
-              periodSeconds: 20
-              failureThreshold: 3
-    - name: realtime
-      startupOrder: 2
-      computePlan: medium
-      minComputePlan: medium
-      containers:
-        - name: realtime
-          image: registry.stackship.se/blueprints/supabase/realtime
-          tag: "v2.76.5"
-          # Upstream's entrypoint is /app/run.sh, which drops privileges with
-          # `sudo -E -u nobody` before running migrations. sudo needs setresuid,
-          # and every container here runs with allowPrivilegeEscalation=false and
-          # all capabilities dropped, so it dies before doing any work. That floor
-          # is deliberate and not relaxable per component — `hardened` gates only
-          # runAsNonRoot and readOnlyRootFilesystem.
-          #
-          # So run.sh's work is inlined without the privilege drop, keeping the
-          # branches this template actually activates (RLIMIT_NOFILE is set,
-          # SEED_SELF_HOST is true) and omitting the ones it does not
-          # (ENABLE_ERL_CRASH_DUMP, GENERATE_CLUSTER_CERTS). tini is kept so PID 1
-          # still reaps.
-          #
-          # The deviation from upstream is that migrations run as root rather than
-          # nobody. The server already ran as root under run.sh, which execs it
-          # after the sudo lines, so this widens the migration step only.
-          #
-          # This mirrors run.sh AT THE PINNED TAG. Re-read it when the tag moves.
-          command:
-            - /usr/bin/tini
-            - -s
-            - -g
-            - --
-            - /bin/bash
-            - -c
-          args:
-            - |
-              set -euo pipefail
-              if [ -n "${RLIMIT_NOFILE:-}" ]; then ulimit -Sn "$RLIMIT_NOFILE"; fi
-              /app/bin/migrate
-              if [ "${SEED_SELF_HOST:-}" = true ]; then
-                /app/bin/realtime eval 'Realtime.Release.seeds(Realtime.Repo)'
-              fi
-              exec /app/bin/server
-          ports:
-            - name: http
-              port: 4000
-          env:
-            - name: PORT
-              value: "4000"
-            - name: DB_HOST
-              value: "[%name%]-postgres"
-            - name: DB_PORT
-              value: "5432"
-            - name: DB_USER
-              value: "supabase_admin"
-            - name: DB_PASSWORD
-              secretRef: { vault: "[%instance_vault%]", key: db_password }
-            - name: DB_NAME
-              value: "postgres"
-            - name: DB_AFTER_CONNECT_QUERY
-              value: "SET search_path TO _realtime"
-            - name: DB_ENC_KEY
-              value: "supabaserealtime"
-            - name: API_JWT_SECRET
-              secretRef: { vault: "[%instance_vault%]", key: jwt_secret }
-            - name: METRICS_JWT_SECRET
-              secretRef: { vault: "[%instance_vault%]", key: jwt_secret }
-            - name: SECRET_KEY_BASE
-              secretRef: { vault: "[%instance_vault%]", key: jwt_secret }
-            - name: SEED_SELF_HOST
-              value: "true"
-            # Realtime resolves the tenant from the first label of the Host
-            # header, and Kong forwards Host as the upstream service name. The
-            # seeded tenant must carry that name; upstream's default,
-            # realtime-dev, matches only its docker-compose hostname.
-            - name: SELF_HOST_TENANT_NAME
-              value: "[%name%]-realtime"
-            - name: RUN_JANITOR
-              value: "true"
-            - name: RLIMIT_NOFILE
-              value: "10000"
-            - name: DISABLE_HEALTHCHECK_LOGGING
-              value: "true"
-            - name: APP_NAME
-              value: "realtime"
-            - name: FLY_ALLOC_ID
-              value: "fly123"
-            - name: FLY_APP_NAME
-              value: "realtime"
-            - name: ERL_AFLAGS
-              value: "-proto_dist inet_tcp"
-            - name: ENABLE_TAILSCALE
-              value: "false"
-            - name: DNS_NODES
-              value: ""
-          probes:
-            readiness:
-              type: http
-              port: http
-              path: /
-              initialDelaySeconds: 10
-              periodSeconds: 10
-              failureThreshold: 6
-            liveness:
-              type: http
-              port: http
-              path: /
-              initialDelaySeconds: 20
               periodSeconds: 20
               failureThreshold: 3
     - name: storage
@@ -519,6 +371,22 @@ instance:
               secretRef: { vault: "[%instance_vault%]", key: jwt_secret }
             - name: DATABASE_URL
               secretRef: { vault: "[%instance_vault%]", key: db_url_storage }
+            # Supabase's own roles are the database's, under the names it gave them.
+            - name: DB_ANON_ROLE
+              secretRef: { vault: "[%instance_vault%]", key: db_role_anon }
+            - name: DB_AUTHENTICATED_ROLE
+              secretRef: { vault: "[%instance_vault%]", key: db_role_authenticated }
+            - name: DB_SERVICE_ROLE
+              secretRef: { vault: "[%instance_vault%]", key: db_role_service }
+            - name: DB_SUPER_USER
+              secretRef: { vault: "[%instance_vault%]", key: db_role_storage_admin }
+            - name: DB_INSTALL_ROLES
+              value: "false"
+            # node-postgres reads sslmode=require as full verification, which the
+            # server's own CA fails; libpq, which every other service uses, encrypts
+            # without verifying. This makes storage do the same.
+            - name: NODE_TLS_REJECT_UNAUTHORIZED
+              value: "0"
             - name: STORAGE_PUBLIC_URL
               value: "https://[%ingress_host%]"
             - name: REQUEST_ALLOW_X_FORWARDED_PATH
@@ -588,18 +456,19 @@ instance:
             - name: PG_META_PORT
               value: "8080"
             - name: PG_META_DB_HOST
-              value: "[%name%]-postgres"
+              secretRef: { vault: "[%instance_vault%]", key: db_host }
             - name: PG_META_DB_PORT
-              value: "5432"
+              secretRef: { vault: "[%instance_vault%]", key: db_port }
             - name: PG_META_DB_NAME
-              value: "postgres"
-            # The same role Studio's SQL editor uses. As `postgres`, /pg/ calls
-            # made with the service_role key cannot alter tables created in
-            # Studio, which belong to supabase_admin.
+              secretRef: { vault: "[%instance_vault%]", key: db_name }
+            - name: PG_META_DB_SSL_MODE
+              value: "require"
+            # The database's owner: it owns the public schema, so tables created
+            # in Studio are the application's, and it can read auth and storage.
             - name: PG_META_DB_USER
-              value: "supabase_admin"
+              secretRef: { vault: "[%instance_vault%]", key: db_owner }
             - name: PG_META_DB_PASSWORD
-              secretRef: { vault: "[%instance_vault%]", key: db_password }
+              secretRef: { vault: "[%instance_vault%]", key: db_owner_password }
             - name: CRYPTO_KEY
               secretRef: { vault: "[%instance_vault%]", key: pg_meta_crypto_key }
           probes:
@@ -784,25 +653,6 @@ instance:
                         strip_path: true
                         paths:
                           - /rest/v1/
-                    plugins:
-                      - name: cors
-                      - name: key-auth
-                        config:
-                          hide_credentials: false
-                      - name: acl
-                        config:
-                          hide_groups_header: true
-                          allow:
-                            - admin
-                            - anon
-                  - name: realtime-v1-ws
-                    _comment: "Realtime: /realtime/v1/* -> ws://realtime:4000/socket/*"
-                    url: http://[%name%]-realtime:4000/socket/
-                    routes:
-                      - name: realtime-v1-ws
-                        strip_path: true
-                        paths:
-                          - /realtime/v1/
                     plugins:
                       - name: cors
                       - name: key-auth
@@ -1112,7 +962,7 @@ instance:
             - name: PG_META_CRYPTO_KEY
               secretRef: { vault: "[%instance_vault%]", key: pg_meta_crypto_key }
             - name: PGRST_DB_SCHEMAS
-              value: "public,storage,graphql_public"
+              value: "public,storage"
             - name: PGRST_DB_MAX_ROWS
               value: "1000"
             - name: SUPABASE_URL
@@ -1126,13 +976,15 @@ instance:
             - name: AUTH_JWT_SECRET
               secretRef: { vault: "[%instance_vault%]", key: jwt_secret }
             - name: POSTGRES_HOST
-              value: "[%name%]-postgres"
+              secretRef: { vault: "[%instance_vault%]", key: db_host }
             - name: POSTGRES_PORT
-              value: "5432"
+              secretRef: { vault: "[%instance_vault%]", key: db_port }
             - name: POSTGRES_DB
-              value: "postgres"
+              secretRef: { vault: "[%instance_vault%]", key: db_name }
+            - name: POSTGRES_USER
+              secretRef: { vault: "[%instance_vault%]", key: db_owner }
             - name: POSTGRES_PASSWORD
-              secretRef: { vault: "[%instance_vault%]", key: db_password }
+              secretRef: { vault: "[%instance_vault%]", key: db_owner_password }
             - name: NEXT_PUBLIC_ENABLE_LOGS
               value: "false"
             - name: NEXT_ANALYTICS_BACKEND_PROVIDER
@@ -1174,7 +1026,7 @@ instance:
       port: http
       expose: ingress
       hostname: "[%ingress_host%]"
-      paths: ["/auth/v1", "/rest/v1", "/realtime/v1", "/storage/v1", "/pg"]
+      paths: ["/auth/v1", "/rest/v1", "/storage/v1", "/pg"]
       issuer: "[%ingress_certificate_issuer%]"
       authGuard: false
 
